@@ -6,6 +6,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 
+def _safe_json(resp: requests.Response) -> dict:
+    try:
+        return resp.json()
+    except ValueError:
+        raise RuntimeError(f"[Feishu] non-JSON response ({resp.status_code}): {resp.text[:200]}")
+
+
 def _sleep_backoff(attempt: int) -> None:
     time.sleep(min(8.0, 0.8 * (2 ** attempt) + random.random() * 0.3))
 
@@ -48,78 +55,13 @@ def get_tenant_access_token(app_id: str, app_secret: str, timeout: int, retries:
     payload = {"app_id": app_id, "app_secret": app_secret}
     headers = {"Content-Type": "application/json; charset=utf-8"}
     resp = http_post(url, headers, payload, timeout, retries)
-    data = resp.json()
+    data = _safe_json(resp)
     if data.get("code") != 0:
         raise RuntimeError(f"[Feishu] token error: {data}")
     token = data.get("tenant_access_token")
     if not token:
         raise RuntimeError(f"[Feishu] token missing: {data}")
     return token
-
-
-def list_bitable_fields(
-    app_token: str,
-    table_id: str,
-    tenant_token: str,
-    timeout: int,
-    retries: int,
-    page_size: int = 200,
-    max_pages: int = 20,
-) -> List[Dict[str, Any]]:
-    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields"
-    headers = {
-        "Authorization": f"Bearer {tenant_token}",
-    }
-
-    items: List[Dict[str, Any]] = []
-    page_token: Optional[str] = None
-
-    for _ in range(max_pages):
-        params: Dict[str, Any] = {"page_size": page_size}
-        if page_token:
-            params["page_token"] = page_token
-        resp = http_get(url, headers, timeout, retries, params=params)
-        data = resp.json()
-        if data.get("code") != 0:
-            raise RuntimeError(f"[Feishu] list fields error: {data}")
-        data_block = data.get("data") or {}
-        items.extend(data_block.get("items") or [])
-        if not data_block.get("has_more"):
-            break
-        page_token = data_block.get("page_token")
-        if not page_token:
-            break
-
-    return items
-
-
-def create_bitable_field(
-    app_token: str,
-    table_id: str,
-    tenant_token: str,
-    field_name: str,
-    field_type: int,
-    timeout: int,
-    retries: int,
-    field_property: Optional[Dict[str, Any]] = None,
-) -> Tuple[bool, Dict[str, Any]]:
-    url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields"
-    headers = {
-        "Authorization": f"Bearer {tenant_token}",
-        "Content-Type": "application/json; charset=utf-8",
-    }
-    body: Dict[str, Any] = {
-        "field_name": field_name,
-        "type": field_type,
-    }
-    if field_property:
-        body["property"] = field_property
-
-    resp = http_post(url, headers, body, timeout, retries)
-    data = resp.json()
-    if data.get("code") != 0:
-        return False, data
-    return True, data
 
 
 def list_bitable_records(
@@ -152,7 +94,7 @@ def list_bitable_records(
             body["sort"] = sort
 
         resp = http_post(url, headers, body, timeout, retries)
-        data = resp.json()
+        data = _safe_json(resp)
         if data.get("code") != 0:
             raise RuntimeError(f"[Feishu] list records error: {data}")
 
@@ -183,7 +125,7 @@ def update_bitable_record_fields(
     }
     body = {"fields": fields}
     resp = http_put(url, headers, body, timeout, retries)
-    data = resp.json()
+    data = _safe_json(resp)
     if data.get("code") != 0:
         return False
     return True
@@ -204,7 +146,7 @@ def create_bitable_record(
     }
     body = {"fields": fields}
     resp = http_post(url, headers, body, timeout, retries)
-    data = resp.json()
+    data = _safe_json(resp)
     if data.get("code") != 0:
         print(f"[Feishu] create record error: {data}", flush=True)
         return False
@@ -226,7 +168,7 @@ def create_bitable_record_with_id(
     }
     body = {"fields": fields}
     resp = http_post(url, headers, body, timeout, retries)
-    data = resp.json()
+    data = _safe_json(resp)
     if data.get("code") != 0:
         print(f"[Feishu] create record error: {data}", flush=True)
         return False, None
@@ -238,28 +180,19 @@ def send_feishu_webhook(webhook_url: str, text: str, timeout: int, retries: int)
     headers = {"Content-Type": "application/json"}
     body = {"msg_type": "text", "content": {"text": text}}
     resp = http_post(webhook_url, headers, body, timeout, retries)
-    data = resp.json()
+    data = _safe_json(resp)
     return data.get("code", 0) == 0
 
 
-def send_feishu_webhook_post(webhook_url: str, title: str, link: str, content_text: str, timeout: int, retries: int) -> bool:
-    headers = {"Content-Type": "application/json"}
-    content_blocks = []
-    if content_text:
-        content_blocks.append([{"tag": "text", "text": content_text}])
-    if link:
-        content_blocks.append([{"tag": "a", "text": "原文链接", "href": link}])
-    body = {
-        "msg_type": "post",
-        "content": {
-            "post": {
-                "zh_cn": {
-                    "title": title,
-                    "content": content_blocks,
-                }
-            }
-        },
-    }
-    resp = http_post(webhook_url, headers, body, timeout, retries)
-    data = resp.json()
-    return data.get("code", 0) == 0
+def get_document_raw_content(doc_token: str, tenant_token: str, timeout: int, retries: int) -> str:
+    url = f"https://open.feishu.cn/open-apis/docx/v1/documents/{doc_token}/raw_content"
+    headers = {"Authorization": f"Bearer {tenant_token}"}
+    resp = http_get(url, headers, timeout, retries)
+    data = _safe_json(resp)
+    if data.get("code") != 0:
+        raise RuntimeError(f"[Feishu] get doc error: {data}")
+    content = (data.get("data") or {}).get("content")
+    if content is None:
+        raise RuntimeError(f"[Feishu] doc content missing: {data}")
+    return content
+

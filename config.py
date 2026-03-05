@@ -1,59 +1,31 @@
-# -*- coding: utf-8 -*-
-import os
-from pathlib import Path
-
-
-def load_env_file(path: Path) -> None:
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                name, value = line.split("=", 1)
-                name = name.strip()
-                value = value.strip().strip('"').strip("'")
-                os.environ.setdefault(name, value)
-    except FileNotFoundError:
-        pass
-
-BASE_DIR = Path(__file__).resolve().parent
-
-# Local env file support (optional)
-load_env_file(BASE_DIR / "rss-ingest-local.env")
-load_env_file(Path(r"F:\coding\rss-ingest-local\rss-ingest-local.env"))
-load_env_file(Path(r"F:\coding\local.env"))
-load_env_file(Path(r"F:\coding\.env"))
+﻿import os
+import re
 
 FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
 FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
+FEISHU_NEWS_TABLE_LINK = os.getenv("FEISHU_NEWS_TABLE_LINK", "")
+FEISHU_RSS_TABLE_LINK = os.getenv("FEISHU_RSS_TABLE_LINK", "")
+FEISHU_PROMPT_DOC_LINK = os.getenv("FEISHU_PROMPT_DOC_LINK", "")
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
+FETCH_INTERVAL_MINUTES = int(os.getenv("FETCH_INTERVAL_MINUTES", "60"))
 
-# 飞书 Bitable App（同一应用可包含多个表）
-FEISHU_APP_TOKEN = os.getenv("FEISHU_APP_TOKEN", "")
-FEISHU_NEWS_TABLE_ID = os.getenv("FEISHU_NEWS_TABLE_ID", "")
-FEISHU_RSS_TABLE_ID = os.getenv("FEISHU_RSS_TABLE_ID", "")
-FEISHU_NOTIFY_TABLE_ID = os.getenv("FEISHU_NOTIFY_TABLE_ID", "")
-FEISHU_WEBHOOK_URL = os.getenv("FEISHU_WEBHOOK_URL", "")
+def _extract_bitable_app_token(url: str) -> str:
+    m = re.search(r"/base/([A-Za-z0-9_-]+)", url)
+    return m.group(1) if m else ""
 
-# Gemini
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-3-flash-preview")
-# Per-task overrides (optional)
-GEMINI_MODEL_NAME_SUMMARY = os.getenv("GEMINI_MODEL_NAME_SUMMARY", GEMINI_MODEL_NAME)
-GEMINI_MODEL_NAME_PRO = os.getenv("GEMINI_MODEL_NAME_PRO", GEMINI_MODEL_NAME)
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL_NAME}:generateContent"
+def _extract_bitable_table_id(url: str) -> str:
+    m = re.search(r"[?&]table=([A-Za-z0-9_-]+)", url)
+    return m.group(1) if m else ""
 
-# Cloudflare Vectorize + Workers AI
-CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")
-CF_API_TOKEN = os.getenv("CF_API_TOKEN", "")
-CF_VECTORIZE_INDEX = os.getenv("CF_VECTORIZE_INDEX", "")
-CF_VECTORIZE_TOP_K = int(os.getenv("CF_VECTORIZE_TOP_K", "5"))
-CF_VECTORIZE_SIM_THRESHOLD = float(os.getenv("CF_VECTORIZE_SIM_THRESHOLD", "0.88"))
-CF_VECTORIZE_METRIC = os.getenv("CF_VECTORIZE_METRIC", "cosine")
-CF_EMBEDDING_MODEL = os.getenv("CF_EMBEDDING_MODEL", "@cf/baai/bge-m3")
-ENABLE_VECTORIZE_DEDUP = os.getenv("ENABLE_VECTORIZE_DEDUP", "true").lower() in {"1", "true", "yes", "y"}
+def _extract_docx_token(url: str) -> str:
+    m = re.search(r"/docx/([A-Za-z0-9_-]+)", url)
+    return m.group(1) if m else ""
 
-# 新闻表字段
+FEISHU_APP_TOKEN = _extract_bitable_app_token(FEISHU_NEWS_TABLE_LINK)
+FEISHU_NEWS_TABLE_ID = _extract_bitable_table_id(FEISHU_NEWS_TABLE_LINK)
+FEISHU_RSS_TABLE_ID = _extract_bitable_table_id(FEISHU_RSS_TABLE_LINK)
+FEISHU_PROMPT_DOC_TOKEN = _extract_docx_token(FEISHU_PROMPT_DOC_LINK)
+
 NEWS_FIELD_TITLE = "标题"
 NEWS_FIELD_SCORE = "AI打分"
 NEWS_FIELD_CATEGORIES = "分类"
@@ -63,10 +35,7 @@ NEWS_FIELD_SOURCE = "来源"
 NEWS_FIELD_FULL_CONTENT = "全文"
 NEWS_FIELD_ITEM_KEY = "item_key"
 NEWS_FIELD_CREATED_TIME = "创建时间"
-NEWS_FIELD_FEATURED = os.getenv("NEWS_FIELD_FEATURED", "精选")
 NEWS_FIELD_READ = "已读"
-
-# RSS 源表字段
 RSS_FIELD_NAME = "name"
 RSS_FIELD_FEED_URL = "feed_url"
 RSS_FIELD_TYPE = "type"
@@ -81,78 +50,30 @@ RSS_FIELD_LAST_ITEM_PUB_TIME = "last_item_pub_time"
 RSS_FIELD_ITEM_ID_STRATEGY = "item_id_strategy"
 RSS_FIELD_CONTENT_LANGUAGE = "content_language"
 RSS_FIELD_FAILED_ITEMS = "failed_items"
-
 DEFAULT_ITEM_ID_STRATEGY = "guid"
 DEFAULT_CONTENT_HASH_ALGO = "md5"
-DEFAULT_FETCH_INTERVAL_MIN = int(os.getenv("DEFAULT_FETCH_INTERVAL_MIN", "180"))
 MAX_ENTRIES_PER_FEED = 200
 NEWS_ITEM_KEY_PREFETCH_LIMIT = 500
-
-# 单选字段选项（需与你在表格中设置一致）
 STATUS_IDLE = "idle"
 STATUS_OK = "ok"
 STATUS_UNSTABLE = "unstable"
 STATUS_DEAD = "dead"
 STATUS_OPTIONS = {STATUS_IDLE, STATUS_OK, STATUS_UNSTABLE, STATUS_DEAD}
-
 FETCH_STATUS_SUCCESS = "success"
 FETCH_STATUS_TIMEOUT = "timeout"
 FETCH_STATUS_HTTP_ERROR = "http_error"
 FETCH_STATUS_PARSE_ERROR = "parse_error"
 FETCH_STATUS_OPTIONS = {FETCH_STATUS_SUCCESS, FETCH_STATUS_TIMEOUT, FETCH_STATUS_HTTP_ERROR, FETCH_STATUS_PARSE_ERROR}
-
 ITEM_ID_STRATEGY_OPTIONS = {"guid", "link", "title_pubdate", "content_hash"}
 CONTENT_LANGUAGE_OPTIONS = {"zh", "en", "jp", "mixed", "other"}
-
 HTTP_TIMEOUT = 20
 HTTP_RETRIES = 3
-
-GEMINI_TIMEOUT = 180
-GEMINI_RETRIES = 10
-FEISHU_MIN_SCORE = 6.0
+NVIDIA_RETRIES = int(os.getenv("NVIDIA_RETRIES", "10"))
 FAILED_ITEMS_MAX = int(os.getenv("FAILED_ITEMS_MAX", "50"))
 FAILED_ITEMS_RETRY_LIMIT = int(os.getenv("FAILED_ITEMS_RETRY_LIMIT", "5"))
 FAILED_ITEMS_MAX_AGE_DAYS = int(os.getenv("FAILED_ITEMS_MAX_AGE_DAYS", "7"))
 FAILED_ITEMS_MAX_MISS = int(os.getenv("FAILED_ITEMS_MAX_MISS", "3"))
-NVIDIA_RETRIES = int(os.getenv("NVIDIA_RETRIES", "10"))
-
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "nvidia").strip().lower()
-IFLOW_API_KEY = os.getenv("IFLOW_API_KEY", "")
-IFLOW_BASE_URL = os.getenv("IFLOW_BASE_URL", "https://apis.iflow.cn/v1").rstrip("/")
-IFLOW_MODEL = os.getenv("IFLOW_MODEL", "qwen3-max")
-IFLOW_TIMEOUT = int(os.getenv("IFLOW_TIMEOUT", "60"))
-IFLOW_RETRIES = int(os.getenv("IFLOW_RETRIES", "10"))
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
-OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "60"))
-OPENAI_RETRIES = int(os.getenv("OPENAI_RETRIES", "10"))
-
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-DEEPSEEK_TIMEOUT = int(os.getenv("DEEPSEEK_TIMEOUT", "60"))
-DEEPSEEK_RETRIES = int(os.getenv("DEEPSEEK_RETRIES", "10"))
-
-ZHIPU_API_KEY = os.getenv("ZHIPU_API_KEY", "")
-ZHIPU_BASE_URL = os.getenv("ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/paas/v4").rstrip("/")
-ZHIPU_MODEL = os.getenv("ZHIPU_MODEL", "glm-4.7")
-ZHIPU_TIMEOUT = int(os.getenv("ZHIPU_TIMEOUT", "60"))
-ZHIPU_RETRIES = int(os.getenv("ZHIPU_RETRIES", "10"))
-
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
-QWEN_MODEL_NAME_SUMMARY = os.getenv("QWEN_MODEL_NAME_SUMMARY", "qwen/qwen3-next-80b-a3b-instruct")
-QWEN_MODEL_NAME_PRO = os.getenv("QWEN_MODEL_NAME_PRO", "qwen/qwen3-next-80b-a3b-instruct")
-
-NOTIFY_FIELD_EVENT = os.getenv("NOTIFY_FIELD_EVENT", "事件")
-NOTIFY_FIELD_DETAIL = os.getenv("NOTIFY_FIELD_DETAIL", "详情")
-NOTIFY_FIELD_PLAIN = os.getenv("NOTIFY_FIELD_PLAIN", "说明")
-NOTIFY_FIELD_TRIGGER_TIME = os.getenv("NOTIFY_FIELD_TRIGGER_TIME", "触发时间")
-NOTIFY_FIELD_NOTIFIED = os.getenv("NOTIFY_FIELD_NOTIFIED", "已通知")
-
-SYSTEM_PROMPT_OVERRIDE = os.getenv("SYSTEM_PROMPT_OVERRIDE", "")
-DEEP_ANALYSIS_PROMPT_OVERRIDE = os.getenv("DEEP_ANALYSIS_PROMPT_OVERRIDE", "")
-FEATURED_PROMPT = os.getenv("FEATURED_PROMPT", "")
 LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "4"))
 PROGRESS_BAR_WIDTH = int(os.getenv("PROGRESS_BAR_WIDTH", "20"))
+DEFAULT_FETCH_INTERVAL_MIN = FETCH_INTERVAL_MINUTES
+
