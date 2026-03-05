@@ -1,0 +1,33 @@
+edition: 3.0.0
+name: rss-ingest
+access: default
+
+vars:
+  region: cn-hongkong
+
+resources:
+  rss-ingest:
+    component: fc3
+    props:
+      region: ${vars.region}
+      functionName: rss-ingest
+      description: RSS智能抓取与飞书新闻表写入
+      runtime: python3.10
+      handler: rss_ingest.handler
+      timeout: 600
+      memorySize: 512
+      code: ./
+      environmentVariables:
+        FEISHU_APP_ID: ${env.FEISHU_APP_ID}
+        FEISHU_APP_SECRET: ${env.FEISHU_APP_SECRET}
+        FEISHU_NEWS_TABLE_LINK: ${env.FEISHU_NEWS_TABLE_LINK}
+        FEISHU_RSS_TABLE_LINK: ${env.FEISHU_RSS_TABLE_LINK}
+        FEISHU_PROMPT_DOC_LINK: ${env.FEISHU_PROMPT_DOC_LINK}
+        NVIDIA_API_KEY: ${env.NVIDIA_API_KEY}
+        FETCH_INTERVAL_MINUTES: ${env.FETCH_INTERVAL_MINUTES}
+      triggers:
+        - triggerName: timer
+          triggerType: timer
+          triggerConfig:
+            cronExpression: "0 0 * * * *"
+            enable: true
