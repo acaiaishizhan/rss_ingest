@@ -47,6 +47,21 @@ def collect_queue_items(items: Iterable[dict], existing_keys: set) -> list:
     return out
 
 
+def enqueue_unique_item(
+    queue: List[Dict[str, Any]],
+    queued_keys: set,
+    source_state: Dict[str, Any],
+    item: Dict[str, Any],
+) -> bool:
+    item_key = str(item.get("item_key") or "").strip()
+    if not item_key or item_key in queued_keys:
+        return False
+    queue.append(item)
+    queued_keys.add(item_key)
+    source_state["pending_count"] += 1
+    return True
+
+
 def render_progress(done: int, total: int, width: int = 20) -> str:
     if total <= 0:
         return "0/0 [" + "".ljust(width, ".") + "]"
@@ -508,12 +523,60 @@ def prefetch_recent_item_keys(tenant_token: str) -> set:
     return keys
 
 
+def build_source_update_fields(state: Dict[str, Any]) -> Dict[str, Any]:
+    update_fields: Dict[str, Any] = {
+        config.RSS_FIELD_STATUS: config.STATUS_OK,
+        config.RSS_FIELD_LAST_FETCH_STATUS: config.FETCH_STATUS_SUCCESS,
+        config.RSS_FIELD_CONSECUTIVE_FAIL_COUNT: 0,
+        config.RSS_FIELD_LAST_FETCH_TIME: state["now_ms"],
+        config.RSS_FIELD_FAILED_ITEMS: serialize_failed_items(
+            prune_failed_items(state["updated_failed_items"], state["now_ms"])
+        ),
+    }
+    if state["latest_pub_ms"]:
+        update_fields[config.RSS_FIELD_LAST_ITEM_PUB_TIME] = state["latest_pub_ms"]
+    if state["latest_key"]:
+        update_fields[config.RSS_FIELD_LAST_ITEM_GUID] = state["latest_key"]
+    return update_fields
+
+
+def persist_source_state(state: Dict[str, Any], tenant_token: str) -> bool:
+    source = state["source"]
+    record_id = source.get("record_id")
+    if not record_id:
+        return False
+    ok = update_bitable_record_fields(
+        config.FEISHU_RSS_APP_TOKEN,
+        config.FEISHU_RSS_TABLE_ID,
+        tenant_token,
+        record_id,
+        build_source_update_fields(state),
+        config.HTTP_TIMEOUT,
+        config.HTTP_RETRIES,
+    )
+    if ok:
+        log(f"[RSS] {source.get('name') or source.get('feed_url')} new={state['new_count']}")
+    else:
+        log(f"[RSS] state update failed for {source.get('name') or source.get('feed_url')}")
+    return ok
+
+
+def persist_ready_source_states(source_states: Dict[str, Dict[str, Any]], tenant_token: str) -> None:
+    for state in source_states.values():
+        if state.get("pending_count", 0) != 0 or state.get("persisted"):
+            continue
+        state["persisted"] = True
+        if not persist_source_state(state, tenant_token):
+            state["persisted"] = False
+
+
 def split_sources_and_queue(
     sources: List[Dict[str, Any]],
     existing_keys: set,
     tenant_token: str,
 ) -> tuple[list, dict, dict]:
     queue: List[Dict[str, Any]] = []
+    queued_keys: set = set()
     source_states: Dict[str, Dict[str, Any]] = {}
     stats = {
         "sources_processed": 0,
@@ -578,7 +641,17 @@ def split_sources_and_queue(
         latest_pub_ms = 0
         latest_key = ""
         processed_keys: set = set()
-        updated_failed_items: List[Dict[str, Any]] = []
+        state = {
+            "source": source,
+            "now_ms": now_ms,
+            "latest_pub_ms": latest_pub_ms,
+            "latest_key": latest_key,
+            "updated_failed_items": [],
+            "new_count": 0,
+            "pending_count": 0,
+            "persisted": False,
+        }
+        updated_failed_items = state["updated_failed_items"]
 
         if failed_items:
             retry_budget = config.FAILED_ITEMS_RETRY_LIMIT
@@ -610,7 +683,10 @@ def split_sources_and_queue(
                     "source": source.get("name") or source.get("feed_url"),
                 }
 
-                queue.append(
+                queued = enqueue_unique_item(
+                    queue,
+                    queued_keys,
+                    state,
                     {
                         "source_id": source["record_id"],
                         "item_key": item_key,
@@ -618,8 +694,11 @@ def split_sources_and_queue(
                         "entry_ts": entry_ts,
                         "entry_ts_ms": entry_ts_ms,
                         "from_failed": True,
-                    }
+                    },
                 )
+                if not queued:
+                    processed_keys.add(item_key)
+                    continue
                 processed_keys.add(item_key)
 
                 if entry_ts_ms > latest_pub_ms:
@@ -648,7 +727,10 @@ def split_sources_and_queue(
                 "source": source.get("name") or source.get("feed_url"),
             }
 
-            queue.append(
+            queued = enqueue_unique_item(
+                queue,
+                queued_keys,
+                state,
                 {
                     "source_id": source["record_id"],
                     "item_key": item_key,
@@ -656,21 +738,19 @@ def split_sources_and_queue(
                     "entry_ts": entry_ts,
                     "entry_ts_ms": entry_ts_ms,
                     "from_failed": False,
-                }
+                },
             )
+            processed_keys.add(item_key)
+            if not queued:
+                continue
 
             if entry_ts_ms > latest_pub_ms:
                 latest_pub_ms = entry_ts_ms
                 latest_key = item_key
 
-        source_states[source["record_id"]] = {
-            "source": source,
-            "now_ms": now_ms,
-            "latest_pub_ms": latest_pub_ms,
-            "latest_key": latest_key,
-            "updated_failed_items": updated_failed_items,
-            "new_count": 0,
-        }
+        state["latest_pub_ms"] = latest_pub_ms
+        state["latest_key"] = latest_key
+        source_states[source["record_id"]] = state
         stats["sources_processed"] += 1
 
     stats["queue_total"] = len(queue)
@@ -691,48 +771,71 @@ def run_llm_queue(
         return
 
     lock = threading.Lock()
+    in_flight_keys: set = set()
 
     def handle_item(item: Dict[str, Any]) -> None:
         state = source_states[item["source_id"]]
         article = item["article"]
-        analysis = analyze_with_nvidia(article, system_prompt)
-        categories = analysis.get("categories") or []
-        if isinstance(categories, list) and any(c in FAILED_CATEGORIES for c in categories):
+        item_key = item["item_key"]
+        has_in_flight_key = False
+        state_to_persist: Optional[Dict[str, Any]] = None
+
+        try:
             with lock:
-                stats["llm_failed"] += 1
-                upsert_failed_item(
-                    state["updated_failed_items"],
-                    item["item_key"],
-                    item["entry_ts_ms"],
-                    article.get("title") or "",
-                    article.get("link") or "",
-                    "llm_failed",
-                    state["now_ms"],
-                )
-            return
+                if item_key in existing_keys or item_key in in_flight_keys:
+                    return
+                in_flight_keys.add(item_key)
+                has_in_flight_key = True
 
-        with lock:
-            stats["llm_success"] += 1
+            analysis = analyze_with_nvidia(article, system_prompt)
+            categories = analysis.get("categories") or []
+            if isinstance(categories, list) and any(c in FAILED_CATEGORIES for c in categories):
+                with lock:
+                    stats["llm_failed"] += 1
+                    upsert_failed_item(
+                        state["updated_failed_items"],
+                        item_key,
+                        item["entry_ts_ms"],
+                        article.get("title") or "",
+                        article.get("link") or "",
+                        "llm_failed",
+                        state["now_ms"],
+                    )
+                return
 
-        fields = build_news_fields(article, analysis, item["item_key"])
-        ok, _ = create_bitable_record_with_id(
-            config.FEISHU_NEWS_APP_TOKEN,
-            config.FEISHU_NEWS_TABLE_ID,
-            tenant_token,
-            fields,
-            config.HTTP_TIMEOUT,
-            config.HTTP_RETRIES,
-        )
-        if not ok:
             with lock:
-                stats["feishu_create_failed"] += 1
-            return
+                stats["llm_success"] += 1
 
-        with lock:
-            existing_keys.add(item["item_key"])
-            stats["entries_processed"] += 1
-            stats["entries_new"] += 1
-            state["new_count"] += 1
+            fields = build_news_fields(article, analysis, item_key)
+            ok, _ = create_bitable_record_with_id(
+                config.FEISHU_NEWS_APP_TOKEN,
+                config.FEISHU_NEWS_TABLE_ID,
+                tenant_token,
+                fields,
+                config.HTTP_TIMEOUT,
+                config.HTTP_RETRIES,
+            )
+            if not ok:
+                with lock:
+                    stats["feishu_create_failed"] += 1
+                return
+
+            with lock:
+                existing_keys.add(item_key)
+                stats["entries_processed"] += 1
+                stats["entries_new"] += 1
+                state["new_count"] += 1
+        finally:
+            with lock:
+                if has_in_flight_key:
+                    in_flight_keys.discard(item_key)
+                state["pending_count"] -= 1
+                if state["pending_count"] == 0 and not state["persisted"]:
+                    state["persisted"] = True
+                    state_to_persist = state
+            if state_to_persist is not None and not persist_source_state(state_to_persist, tenant_token):
+                with lock:
+                    state_to_persist["persisted"] = False
 
     done = 0
     with ThreadPoolExecutor(max_workers=config.LLM_CONCURRENCY) as executor:
@@ -846,6 +949,7 @@ def main() -> Dict[str, Any]:
             existing_keys = set()
 
         queue, source_states, fetch_stats = split_sources_and_queue(enabled_sources, existing_keys, tenant_token)
+        persist_ready_source_states(source_states, tenant_token)
         stats = {
             "llm_success": 0,
             "llm_failed": 0,
@@ -857,31 +961,7 @@ def main() -> Dict[str, Any]:
         log(f"[Queue] total={stats['queue_total']} sources_processed={stats['sources_processed']} sources_skipped={stats['sources_skipped']}")
 
         run_llm_queue(queue, source_states, tenant_token, existing_keys, system_prompt, stats)
-
-        for state in source_states.values():
-            source = state["source"]
-            update_fields: Dict[str, Any] = {
-                config.RSS_FIELD_STATUS: config.STATUS_OK,
-                config.RSS_FIELD_LAST_FETCH_STATUS: config.FETCH_STATUS_SUCCESS,
-                config.RSS_FIELD_CONSECUTIVE_FAIL_COUNT: 0,
-                config.RSS_FIELD_LAST_FETCH_TIME: state["now_ms"],
-                config.RSS_FIELD_FAILED_ITEMS: serialize_failed_items(prune_failed_items(state["updated_failed_items"], state["now_ms"])),
-            }
-            if state["latest_pub_ms"]:
-                update_fields[config.RSS_FIELD_LAST_ITEM_PUB_TIME] = state["latest_pub_ms"]
-            if state["latest_key"]:
-                update_fields[config.RSS_FIELD_LAST_ITEM_GUID] = state["latest_key"]
-
-            update_bitable_record_fields(
-                config.FEISHU_RSS_APP_TOKEN,
-                config.FEISHU_RSS_TABLE_ID,
-                tenant_token,
-                source["record_id"],
-                update_fields,
-                config.HTTP_TIMEOUT,
-                config.HTTP_RETRIES,
-            )
-            log(f"[RSS] {source.get('name') or source.get('feed_url')} new={state['new_count']}")
+        persist_ready_source_states(source_states, tenant_token)
 
         log(
             "[Summary] "
