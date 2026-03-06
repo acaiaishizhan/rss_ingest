@@ -3,31 +3,32 @@ name: rss-ingest
 access: default
 
 vars:
-  region: cn-hongkong
+  autoFetchSchedule: ${env('AUTO_FETCH_SCHEDULE', '0 0 * * * *')}
 
 resources:
   rss-ingest:
     component: fc3
     props:
-      region: ${vars.region}
+      region: cn-hangzhou
       functionName: rss-ingest
-      description: RSS智能抓取与飞书新闻表写入
+      description: 定时抓取 RSS 并写入飞书新闻表
       runtime: python3.10
       handler: rss_ingest.handler
       timeout: 600
       memorySize: 512
+      internetAccess: true
       code: ./
       environmentVariables:
-        FEISHU_APP_ID: ${env.FEISHU_APP_ID}
-        FEISHU_APP_SECRET: ${env.FEISHU_APP_SECRET}
-        FEISHU_NEWS_TABLE_LINK: ${env.FEISHU_NEWS_TABLE_LINK}
-        FEISHU_RSS_TABLE_LINK: ${env.FEISHU_RSS_TABLE_LINK}
-        FEISHU_PROMPT_DOC_LINK: ${env.FEISHU_PROMPT_DOC_LINK}
-        NVIDIA_API_KEY: ${env.NVIDIA_API_KEY}
-        FETCH_INTERVAL_MINUTES: ${env.FETCH_INTERVAL_MINUTES}
+        FEISHU_APP_ID: ${env('FEISHU_APP_ID', '')}
+        FEISHU_APP_SECRET: ${env('FEISHU_APP_SECRET', '')}
+        FEISHU_NEWS_TABLE_LINK: ${env('FEISHU_NEWS_TABLE_LINK', '')}
+        FEISHU_RSS_TABLE_LINK: ${env('FEISHU_RSS_TABLE_LINK', '')}
+        FEISHU_PROMPT_DOC_LINK: ${env('FEISHU_PROMPT_DOC_LINK', '')}
+        NVIDIA_API_KEY: ${env('NVIDIA_API_KEY', '')}
+        AUTO_FETCH_SCHEDULE: ${vars.autoFetchSchedule}
       triggers:
-        - triggerName: timer
+        - triggerName: hourly-rss-ingest
           triggerType: timer
           triggerConfig:
-            cronExpression: "0 0 * * * *"
+            cronExpression: ${vars.autoFetchSchedule}
             enable: true

@@ -489,7 +489,7 @@ def prefetch_recent_item_keys(tenant_token: str) -> set:
     sort_field = config.NEWS_FIELD_CREATED_TIME
     sort = [{"field_name": sort_field, "order": "desc"}]
     records = list_bitable_records(
-        config.FEISHU_APP_TOKEN,
+        config.FEISHU_NEWS_APP_TOKEN,
         config.FEISHU_NEWS_TABLE_ID,
         tenant_token,
         config.HTTP_TIMEOUT,
@@ -545,7 +545,7 @@ def split_sources_and_queue(
             status = derive_overall_status(fail_count, True)
             fetch_status = derive_fetch_status(exc)
             update_bitable_record_fields(
-                config.FEISHU_APP_TOKEN,
+                config.FEISHU_RSS_APP_TOKEN,
                 config.FEISHU_RSS_TABLE_ID,
                 tenant_token,
                 source["record_id"],
@@ -716,7 +716,7 @@ def run_llm_queue(
 
         fields = build_news_fields(article, analysis, item["item_key"])
         ok, _ = create_bitable_record_with_id(
-            config.FEISHU_APP_TOKEN,
+            config.FEISHU_NEWS_APP_TOKEN,
             config.FEISHU_NEWS_TABLE_ID,
             tenant_token,
             fields,
@@ -757,20 +757,66 @@ def run_llm_queue(
             sys.stdout.flush()
 
 
-def main() -> None:
+def validate_runtime_config() -> List[str]:
+    errors: List[str] = []
+
+    def require(value: str, label: str, hint: str) -> None:
+        if not value:
+            errors.append(f"{label} 未配置。{hint}")
+
+    require(config.FEISHU_APP_ID, "FEISHU_APP_ID", "请填写飞书应用 App ID。")
+    require(config.FEISHU_APP_SECRET, "FEISHU_APP_SECRET", "请填写飞书应用 App Secret。")
+    require(
+        config.FEISHU_NEWS_APP_TOKEN,
+        "FEISHU_NEWS_APP_TOKEN / FEISHU_NEWS_TABLE_LINK",
+        "建议直接填写 FEISHU_NEWS_APP_TOKEN；也可以通过 FEISHU_NEWS_TABLE_LINK 自动解析。",
+    )
+    require(
+        config.FEISHU_NEWS_TABLE_ID,
+        "FEISHU_NEWS_TABLE_ID / FEISHU_NEWS_TABLE_LINK",
+        "建议直接填写 FEISHU_NEWS_TABLE_ID；也可以通过 FEISHU_NEWS_TABLE_LINK 自动解析。",
+    )
+    require(
+        config.FEISHU_RSS_APP_TOKEN,
+        "FEISHU_RSS_APP_TOKEN / FEISHU_RSS_TABLE_LINK",
+        "建议直接填写 FEISHU_RSS_APP_TOKEN；也可以通过 FEISHU_RSS_TABLE_LINK 自动解析。",
+    )
+    require(
+        config.FEISHU_RSS_TABLE_ID,
+        "FEISHU_RSS_TABLE_ID / FEISHU_RSS_TABLE_LINK",
+        "建议直接填写 FEISHU_RSS_TABLE_ID；也可以通过 FEISHU_RSS_TABLE_LINK 自动解析。",
+    )
+    require(
+        config.FEISHU_PROMPT_DOC_TOKEN,
+        "FEISHU_PROMPT_DOC_TOKEN / FEISHU_PROMPT_DOC_LINK",
+        "建议直接填写 FEISHU_PROMPT_DOC_TOKEN；也可以通过 FEISHU_PROMPT_DOC_LINK 自动解析。",
+    )
+    require(
+        config.NVIDIA_API_KEY,
+        "NVIDIA_API_KEY",
+        "当前版本默认使用 NVIDIA API 做新闻分析，未提供其他模型降级路径。",
+    )
+    return errors
+
+
+def log_runtime_config_errors(errors: List[str]) -> None:
+    log("[Config] startup validation failed. The function will stop before fetching RSS.")
+    for index, error in enumerate(errors, start=1):
+        log(f"[Config] {index}. {error}")
+
+
+def main() -> Dict[str, Any]:
     try:
-        required = []
-        if not config.FEISHU_APP_TOKEN:
-            required.append("FEISHU_APP_TOKEN")
-        if not config.FEISHU_NEWS_TABLE_ID:
-            required.append("FEISHU_NEWS_TABLE_ID")
-        if not config.FEISHU_RSS_TABLE_ID:
-            required.append("FEISHU_RSS_TABLE_ID")
-        if not config.FEISHU_PROMPT_DOC_TOKEN:
-            required.append("FEISHU_PROMPT_DOC_TOKEN")
-        if required:
-            log(f"[Config] missing: {', '.join(required)}")
-            return
+        config_errors = validate_runtime_config()
+        if config_errors:
+            log_runtime_config_errors(config_errors)
+            raise RuntimeError("required configuration is missing or invalid")
+
+        log(
+            "[Config] startup validation passed. "
+            f"fetch_interval_minutes={config.DEFAULT_FETCH_INTERVAL_MIN} "
+            f"llm_concurrency={config.LLM_CONCURRENCY}"
+        )
         tenant_token = get_tenant_access_token(config.FEISHU_APP_ID, config.FEISHU_APP_SECRET, config.HTTP_TIMEOUT, config.HTTP_RETRIES)
         system_prompt = get_document_raw_content(
             config.FEISHU_PROMPT_DOC_TOKEN,
@@ -780,10 +826,9 @@ def main() -> None:
         )
         log(f"[Prompt] fetched {len(system_prompt)} chars")
         if not system_prompt.strip():
-            log("[Prompt] ERROR: fetched empty prompt, aborting")
-            return
+            raise RuntimeError("prompt document is empty")
         records = list_bitable_records(
-            config.FEISHU_APP_TOKEN,
+            config.FEISHU_RSS_APP_TOKEN,
             config.FEISHU_RSS_TABLE_ID,
             tenant_token,
             config.HTTP_TIMEOUT,
@@ -828,7 +873,7 @@ def main() -> None:
                 update_fields[config.RSS_FIELD_LAST_ITEM_GUID] = state["latest_key"]
 
             update_bitable_record_fields(
-                config.FEISHU_APP_TOKEN,
+                config.FEISHU_RSS_APP_TOKEN,
                 config.FEISHU_RSS_TABLE_ID,
                 tenant_token,
                 source["record_id"],
@@ -850,14 +895,18 @@ def main() -> None:
             f"llm_failed={stats['llm_failed']} "
             f"feishu_failed={stats['feishu_create_failed']}"
         )
+        return {
+            "ok": True,
+            "message": "rss ingest completed",
+            "stats": stats,
+        }
     except Exception as exc:
         log(f"[Main] fatal error: {exc}")
         raise
 
 
 def handler(event, context):
-    main()
-    return 'ok'
+    return main()
 
 
 if __name__ == "__main__":

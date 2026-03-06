@@ -1,30 +1,186 @@
-﻿import os
+import math
+import os
 import re
 
-FEISHU_APP_ID = os.getenv("FEISHU_APP_ID", "")
-FEISHU_APP_SECRET = os.getenv("FEISHU_APP_SECRET", "")
-FEISHU_NEWS_TABLE_LINK = os.getenv("FEISHU_NEWS_TABLE_LINK", "")
-FEISHU_RSS_TABLE_LINK = os.getenv("FEISHU_RSS_TABLE_LINK", "")
-FEISHU_PROMPT_DOC_LINK = os.getenv("FEISHU_PROMPT_DOC_LINK", "")
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
-FETCH_INTERVAL_MINUTES = int(os.getenv("FETCH_INTERVAL_MINUTES", "60"))
+
+DEFAULT_AUTO_FETCH_SCHEDULE = "0 0 * * * *"
+
+
+def read_optional_str(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip()
+    return value if value else default
+
+
+def read_required_str(name: str) -> str:
+    return read_optional_str(name, "")
+
+
+def read_int(name: str, default: int, minimum: int | None = None) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip()
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None and parsed < minimum:
+        return default
+    return parsed
+
+
+def _first_non_empty(*values: str) -> str:
+    for value in values:
+        if value:
+            return value
+    return ""
+
 
 def _extract_bitable_app_token(url: str) -> str:
     m = re.search(r"/base/([A-Za-z0-9_-]+)", url)
     return m.group(1) if m else ""
 
+
 def _extract_bitable_table_id(url: str) -> str:
     m = re.search(r"[?&]table=([A-Za-z0-9_-]+)", url)
     return m.group(1) if m else ""
+
 
 def _extract_docx_token(url: str) -> str:
     m = re.search(r"/docx/([A-Za-z0-9_-]+)", url)
     return m.group(1) if m else ""
 
-FEISHU_APP_TOKEN = _extract_bitable_app_token(FEISHU_NEWS_TABLE_LINK)
-FEISHU_NEWS_TABLE_ID = _extract_bitable_table_id(FEISHU_NEWS_TABLE_LINK)
-FEISHU_RSS_TABLE_ID = _extract_bitable_table_id(FEISHU_RSS_TABLE_LINK)
-FEISHU_PROMPT_DOC_TOKEN = _extract_docx_token(FEISHU_PROMPT_DOC_LINK)
+
+def _split_schedule_fields(schedule: str) -> list[str]:
+    parts = schedule.strip().split()
+    if parts and parts[0].startswith("CRON_TZ="):
+        parts = parts[1:]
+    return parts
+
+
+def _extract_step(value: str) -> int:
+    m = re.fullmatch(r"(?:\*|\d+)/(\d+)", value)
+    if not m:
+        return 0
+    step = int(m.group(1))
+    return step if step > 0 else 0
+
+
+def _extract_sorted_numbers(value: str, minimum: int, maximum: int) -> list[int]:
+    if not value or any(ch in value for ch in ("*", "/", "-", "?", "L", "W", "#")):
+        return []
+    items = []
+    for part in value.split(","):
+        if not part.isdigit():
+            return []
+        number = int(part)
+        if number < minimum or number > maximum:
+            return []
+        items.append(number)
+    return sorted(set(items))
+
+
+def _derive_step_from_numbers(numbers: list[int], cycle: int) -> int:
+    if not numbers:
+        return 0
+    if len(numbers) == 1:
+        return cycle
+    diffs = []
+    for left, right in zip(numbers, numbers[1:]):
+        if right > left:
+            diffs.append(right - left)
+    wrap_diff = cycle - numbers[-1] + numbers[0]
+    if wrap_diff > 0:
+        diffs.append(wrap_diff)
+    step = 0
+    for diff in diffs:
+        step = diff if step == 0 else math.gcd(step, diff)
+    return step
+
+
+def _derive_interval_from_schedule(schedule: str, fallback: int = 60) -> int:
+    fields = _split_schedule_fields(schedule)
+    if len(fields) >= 6:
+        minute_field = fields[1]
+        hour_field = fields[2]
+    elif len(fields) == 5:
+        minute_field = fields[0]
+        hour_field = fields[1]
+    else:
+        return fallback
+
+    if minute_field == "*":
+        return 1
+
+    minute_step = _extract_step(minute_field)
+    if minute_step:
+        return minute_step
+
+    minute_numbers = _extract_sorted_numbers(minute_field, 0, 59)
+    if minute_numbers and hour_field == "*":
+        if len(minute_numbers) == 1:
+            return 60
+        minute_list_step = _derive_step_from_numbers(minute_numbers, 60)
+        return minute_list_step or fallback
+
+    if minute_field.isdigit() and hour_field == "*":
+        return 60
+
+    hour_step = _extract_step(hour_field)
+    if hour_step and (minute_field.isdigit() or minute_field == "0"):
+        return hour_step * 60
+
+    hour_numbers = _extract_sorted_numbers(hour_field, 0, 23)
+    if hour_numbers and (minute_field.isdigit() or minute_field == "0"):
+        hour_list_step = _derive_step_from_numbers(hour_numbers, 24)
+        return (hour_list_step * 60) if hour_list_step else fallback
+
+    if minute_field.isdigit() and hour_field.isdigit():
+        return 24 * 60
+
+    return fallback
+
+
+FEISHU_APP_ID = read_required_str("FEISHU_APP_ID")
+FEISHU_APP_SECRET = read_required_str("FEISHU_APP_SECRET")
+FEISHU_NEWS_TABLE_LINK = read_optional_str("FEISHU_NEWS_TABLE_LINK")
+FEISHU_RSS_TABLE_LINK = read_optional_str("FEISHU_RSS_TABLE_LINK")
+FEISHU_PROMPT_DOC_LINK = read_optional_str("FEISHU_PROMPT_DOC_LINK")
+NVIDIA_API_KEY = read_optional_str("NVIDIA_API_KEY")
+
+LEGACY_FEISHU_APP_TOKEN = read_optional_str("FEISHU_APP_TOKEN")
+
+# New deployments should provide links; token/id fields remain as hidden compatibility fallbacks.
+FEISHU_NEWS_APP_TOKEN = _first_non_empty(
+    _extract_bitable_app_token(FEISHU_NEWS_TABLE_LINK),
+    read_optional_str("FEISHU_NEWS_APP_TOKEN"),
+    LEGACY_FEISHU_APP_TOKEN,
+)
+FEISHU_NEWS_TABLE_ID = _first_non_empty(
+    _extract_bitable_table_id(FEISHU_NEWS_TABLE_LINK),
+    read_optional_str("FEISHU_NEWS_TABLE_ID"),
+)
+FEISHU_RSS_APP_TOKEN = _first_non_empty(
+    _extract_bitable_app_token(FEISHU_RSS_TABLE_LINK),
+    read_optional_str("FEISHU_RSS_APP_TOKEN"),
+    LEGACY_FEISHU_APP_TOKEN,
+)
+FEISHU_RSS_TABLE_ID = _first_non_empty(
+    _extract_bitable_table_id(FEISHU_RSS_TABLE_LINK),
+    read_optional_str("FEISHU_RSS_TABLE_ID"),
+)
+FEISHU_PROMPT_DOC_TOKEN = _first_non_empty(
+    _extract_docx_token(FEISHU_PROMPT_DOC_LINK),
+    read_optional_str("FEISHU_PROMPT_DOC_TOKEN"),
+)
+
+# Backward-compatible alias for legacy callers and old deployments.
+FEISHU_APP_TOKEN = FEISHU_NEWS_APP_TOKEN
 
 NEWS_FIELD_TITLE = "标题"
 NEWS_FIELD_SCORE = "AI打分"
@@ -66,14 +222,19 @@ FETCH_STATUS_PARSE_ERROR = "parse_error"
 FETCH_STATUS_OPTIONS = {FETCH_STATUS_SUCCESS, FETCH_STATUS_TIMEOUT, FETCH_STATUS_HTTP_ERROR, FETCH_STATUS_PARSE_ERROR}
 ITEM_ID_STRATEGY_OPTIONS = {"guid", "link", "title_pubdate", "content_hash"}
 CONTENT_LANGUAGE_OPTIONS = {"zh", "en", "jp", "mixed", "other"}
-HTTP_TIMEOUT = 20
-HTTP_RETRIES = 3
-NVIDIA_RETRIES = int(os.getenv("NVIDIA_RETRIES", "10"))
-FAILED_ITEMS_MAX = int(os.getenv("FAILED_ITEMS_MAX", "50"))
-FAILED_ITEMS_RETRY_LIMIT = int(os.getenv("FAILED_ITEMS_RETRY_LIMIT", "5"))
-FAILED_ITEMS_MAX_AGE_DAYS = int(os.getenv("FAILED_ITEMS_MAX_AGE_DAYS", "7"))
-FAILED_ITEMS_MAX_MISS = int(os.getenv("FAILED_ITEMS_MAX_MISS", "3"))
-LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "4"))
-PROGRESS_BAR_WIDTH = int(os.getenv("PROGRESS_BAR_WIDTH", "20"))
+AUTO_FETCH_SCHEDULE = read_optional_str("AUTO_FETCH_SCHEDULE", DEFAULT_AUTO_FETCH_SCHEDULE)
+FETCH_INTERVAL_MINUTES = read_int(
+    "FETCH_INTERVAL_MINUTES",
+    _derive_interval_from_schedule(AUTO_FETCH_SCHEDULE, fallback=60),
+    minimum=1,
+)
+HTTP_TIMEOUT = read_int("HTTP_TIMEOUT", 20, minimum=1)
+HTTP_RETRIES = read_int("HTTP_RETRIES", 3, minimum=1)
+NVIDIA_RETRIES = read_int("NVIDIA_RETRIES", 10, minimum=1)
+FAILED_ITEMS_MAX = read_int("FAILED_ITEMS_MAX", 50, minimum=1)
+FAILED_ITEMS_RETRY_LIMIT = read_int("FAILED_ITEMS_RETRY_LIMIT", 5, minimum=1)
+FAILED_ITEMS_MAX_AGE_DAYS = read_int("FAILED_ITEMS_MAX_AGE_DAYS", 7, minimum=1)
+FAILED_ITEMS_MAX_MISS = read_int("FAILED_ITEMS_MAX_MISS", 3, minimum=1)
+LLM_CONCURRENCY = read_int("LLM_CONCURRENCY", 4, minimum=1)
+PROGRESS_BAR_WIDTH = read_int("PROGRESS_BAR_WIDTH", 20, minimum=1)
 DEFAULT_FETCH_INTERVAL_MIN = FETCH_INTERVAL_MINUTES
-
