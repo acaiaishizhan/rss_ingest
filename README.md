@@ -47,6 +47,36 @@
 - 如果你想改频率，只需要改一个入口：自动抓取频率。
 - 不需要同时理解多套频率参数。
 
+## 本地运行
+
+如果你想先在本地跑通一遍，可以直接用项目根目录的 `.env` 文件。
+
+1. 创建并启用虚拟环境
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+2. 安装依赖
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+3. 填写 `.env`
+
+- 必填：`FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`FEISHU_NEWS_TABLE_LINK`、`FEISHU_RSS_TABLE_LINK`、`FEISHU_PROMPT_DOC_LINK`、`NVIDIA_API_KEY`
+- 可选：`AUTO_FETCH_SCHEDULE`、`HTTP_TIMEOUT`、`HTTP_RETRIES`、`LLM_CONCURRENCY`
+
+程序启动时会自动读取项目根目录 `.env`，本地运行不需要手动 `set` 环境变量。
+
+4. 启动
+
+```powershell
+python rss_ingest.py
+```
+
 ## 哪些问题会影响运行结果
 
 下面这些问题会影响抓取结果，但不等于“阿里云部署失败”：

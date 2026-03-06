@@ -3,6 +3,9 @@ __pycache__/
 *.pyo
 *.db
 *.sqlite3
+.env
+.venv/
+venv/
 *input_snapshot.json
 daily_ai_ranked*.json
 .worktrees/

@@ -6,6 +6,36 @@ import re
 DEFAULT_AUTO_FETCH_SCHEDULE = "0 0 * * * *"
 
 
+def load_local_env(filename: str = ".env") -> None:
+    path = os.path.join(os.path.dirname(__file__), filename)
+    if not os.path.exists(path):
+        return
+
+    with open(path, "r", encoding="utf-8") as env_file:
+        for raw_line in env_file:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            if "=" not in line:
+                continue
+
+            name, value = line.split("=", 1)
+            name = name.strip()
+            value = value.strip()
+            if not name or name in os.environ:
+                continue
+
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+
+            os.environ[name] = value
+
+
+load_local_env()
+
+
 def read_optional_str(name: str, default: str = "") -> str:
     value = os.getenv(name)
     if value is None:
@@ -235,6 +265,6 @@ FAILED_ITEMS_MAX = read_int("FAILED_ITEMS_MAX", 50, minimum=1)
 FAILED_ITEMS_RETRY_LIMIT = read_int("FAILED_ITEMS_RETRY_LIMIT", 5, minimum=1)
 FAILED_ITEMS_MAX_AGE_DAYS = read_int("FAILED_ITEMS_MAX_AGE_DAYS", 7, minimum=1)
 FAILED_ITEMS_MAX_MISS = read_int("FAILED_ITEMS_MAX_MISS", 3, minimum=1)
-LLM_CONCURRENCY = read_int("LLM_CONCURRENCY", 4, minimum=1)
+LLM_CONCURRENCY = read_int("LLM_CONCURRENCY", 10, minimum=1)
 PROGRESS_BAR_WIDTH = read_int("PROGRESS_BAR_WIDTH", 20, minimum=1)
 DEFAULT_FETCH_INTERVAL_MIN = FETCH_INTERVAL_MINUTES
