@@ -1,0 +1,59 @@
+Edition: 3.0.0
+Type: Project
+Name: rss-ingest
+Provider:
+  - 阿里云
+Version: 1.0.0
+Description: 定时抓取 RSS 并写入飞书新闻表
+HomePage: https://gitee.com/ccccqwwww/rss-cron-test
+Tags:
+  - RSS
+  - 飞书
+  - 定时任务
+Category: 其它
+Service:
+  函数计算:
+    Authorities:
+      - AliyunFCFullAccess
+Organization: ccccqwwww
+Effective: Public
+Parameters:
+  type: object
+  additionalProperties: false
+  required:
+    - feishuAppId
+    - feishuAppSecret
+    - newsTableLink
+    - rssTableLink
+    - promptDocLink
+    - modelApiKey
+  properties:
+    feishuAppId:
+      type: string
+      title: 飞书应用 ID
+      description: 填写你的飞书应用 App ID。
+    feishuAppSecret:
+      type: secret
+      title: 飞书应用 Secret
+      description: 填写与你的飞书应用配套的 App Secret。
+    newsTableLink:
+      type: string
+      title: 飞书新闻表链接
+      description: 粘贴用于写入新闻结果的飞书多维表格链接。
+    rssTableLink:
+      type: string
+      title: 飞书 RSS 源表链接
+      description: 粘贴存放 RSS 订阅源的飞书多维表格链接。
+    promptDocLink:
+      type: string
+      title: 飞书 Prompt 文档链接
+      description: 粘贴存放分析提示词的飞书文档链接。
+    modelApiKey:
+      type: secret
+      title: 模型 API Key
+      description: 填写用于新闻摘要、分类和评分的模型接口密钥。
+    autoFetchSchedule:
+      type: string
+      title: 自动抓取频率
+      description: 控制多久自动抓取一次，默认每小时一次。
+      default: 0 0 * * * *

@@ -3,14 +3,17 @@ name: rss-ingest
 access: default
 
 vars:
-  autoFetchSchedule: ${env('AUTO_FETCH_SCHEDULE', '0 0 * * * *')}
+  region: ap-southeast-1
+  functionName: rss-ingest-sg
+${file('./填写这里.yml')}
+  autoFetchSchedule: "{{if vars.autoFetchIntervalMinutes == 5}}0 */5 * * * *{{else if vars.autoFetchIntervalMinutes == 10}}0 */10 * * * *{{else if vars.autoFetchIntervalMinutes == 15}}0 */15 * * * *{{else if vars.autoFetchIntervalMinutes == 20}}0 */20 * * * *{{else if vars.autoFetchIntervalMinutes == 30}}0 */30 * * * *{{else if vars.autoFetchIntervalMinutes == 60}}0 0 * * * *{{else if vars.autoFetchIntervalMinutes == 120}}0 0 */2 * * *{{else if vars.autoFetchIntervalMinutes == 180}}0 0 */3 * * *{{else if vars.autoFetchIntervalMinutes == 240}}0 0 */4 * * *{{else if vars.autoFetchIntervalMinutes == 360}}0 0 */6 * * *{{else if vars.autoFetchIntervalMinutes == 480}}0 0 */8 * * *{{else if vars.autoFetchIntervalMinutes == 720}}0 0 */12 * * *{{else if vars.autoFetchIntervalMinutes == 1440}}0 0 0 * * *{{else}}0 0 * * * *{{/if}}"
 
 resources:
   rss-ingest:
     component: fc3
     props:
-      region: cn-hangzhou
-      functionName: rss-ingest
+      region: ${vars.region}
+      functionName: ${vars.functionName}
       description: 定时抓取 RSS 并写入飞书新闻表
       runtime: python3.10
       handler: rss_ingest.handler
@@ -19,15 +22,15 @@ resources:
       internetAccess: true
       code: ./
       environmentVariables:
-        FEISHU_APP_ID: ${env('FEISHU_APP_ID', '')}
-        FEISHU_APP_SECRET: ${env('FEISHU_APP_SECRET', '')}
-        FEISHU_NEWS_TABLE_LINK: ${env('FEISHU_NEWS_TABLE_LINK', '')}
-        FEISHU_RSS_TABLE_LINK: ${env('FEISHU_RSS_TABLE_LINK', '')}
-        FEISHU_PROMPT_DOC_LINK: ${env('FEISHU_PROMPT_DOC_LINK', '')}
-        NVIDIA_API_KEY: ${env('NVIDIA_API_KEY', '')}
+        FEISHU_APP_ID: ${vars.feishuAppId}
+        FEISHU_APP_SECRET: ${vars.feishuAppSecret}
+        FEISHU_NEWS_TABLE_LINK: ${vars.newsTableLink}
+        FEISHU_RSS_TABLE_LINK: ${vars.rssTableLink}
+        FEISHU_PROMPT_DOC_LINK: ${vars.promptDocLink}
+        NVIDIA_API_KEY: ${vars.modelApiKey}
         AUTO_FETCH_SCHEDULE: ${vars.autoFetchSchedule}
       triggers:
-        - triggerName: hourly-rss-ingest
+        - triggerName: rss-ingest-timer
           triggerType: timer
           triggerConfig:
             cronExpression: ${vars.autoFetchSchedule}

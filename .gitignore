@@ -6,6 +6,7 @@ __pycache__/
 .env
 .venv/
 venv/
+!填写这里.yml
 *input_snapshot.json
 daily_ai_ranked*.json
 .worktrees/
