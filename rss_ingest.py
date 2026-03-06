@@ -228,8 +228,8 @@ def parse_llm_json(raw_text: str, service: str) -> Optional[Dict[str, Any]]:
  
 def analyze_with_nvidia(article: Dict[str, Any], system_prompt: str) -> Dict[str, Any]:
     if not config.NVIDIA_API_KEY:
-        log("[NVIDIA] error: missing NVIDIA_API_KEY")
-        return {"categories": ["调用失败"], "score": 0.0, "summary": "missing NVIDIA_API_KEY", "title_zh": "", "one_liner": "", "points": []}
+        log("[NVIDIA] error: missing NVIDIA API Key")
+        return {"categories": ["调用失败"], "score": 0.0, "summary": "missing NVIDIA API Key", "title_zh": "", "one_liner": "", "points": []}
 
     prompt = build_prompt(article, system_prompt)
     url = "https://integrate.api.nvidia.com/v1/chat/completions"
@@ -454,15 +454,9 @@ def normalize_source(record: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def should_fetch(source: Dict[str, Any], now_ms: int) -> bool:
-    if not source.get("enabled"):
-        return False
-    interval_min = config.DEFAULT_FETCH_INTERVAL_MIN
-    last_item_pub = source.get("last_item_pub_time") or 0
-    last_fetch = source.get("last_fetch_time") or 0
-    last_base = last_item_pub or last_fetch
-    if last_base <= 0:
-        return True
-    return now_ms - last_base >= interval_min * 60 * 1000
+    _ = now_ms
+    # The only active frequency gate is the FC timer trigger configured in the console.
+    return bool(source.get("enabled"))
 
 
 def build_news_fields(article: Dict[str, Any], analysis: Dict[str, Any], item_key: str) -> Dict[str, Any]:
@@ -524,18 +518,18 @@ def prefetch_recent_item_keys(tenant_token: str) -> set:
 
 
 def build_source_update_fields(state: Dict[str, Any]) -> Dict[str, Any]:
+    pruned_failed_items = prune_failed_items(state["updated_failed_items"], state["now_ms"])
+    has_failed_items = bool(pruned_failed_items)
     update_fields: Dict[str, Any] = {
-        config.RSS_FIELD_STATUS: config.STATUS_OK,
+        config.RSS_FIELD_STATUS: config.STATUS_UNSTABLE if has_failed_items else config.STATUS_OK,
         config.RSS_FIELD_LAST_FETCH_STATUS: config.FETCH_STATUS_SUCCESS,
         config.RSS_FIELD_CONSECUTIVE_FAIL_COUNT: 0,
         config.RSS_FIELD_LAST_FETCH_TIME: state["now_ms"],
-        config.RSS_FIELD_FAILED_ITEMS: serialize_failed_items(
-            prune_failed_items(state["updated_failed_items"], state["now_ms"])
-        ),
+        config.RSS_FIELD_FAILED_ITEMS: serialize_failed_items(pruned_failed_items),
     }
-    if state["latest_pub_ms"]:
+    if not has_failed_items and state["latest_pub_ms"]:
         update_fields[config.RSS_FIELD_LAST_ITEM_PUB_TIME] = state["latest_pub_ms"]
-    if state["latest_key"]:
+    if not has_failed_items and state["latest_key"]:
         update_fields[config.RSS_FIELD_LAST_ITEM_GUID] = state["latest_key"]
     return update_fields
 
@@ -818,6 +812,15 @@ def run_llm_queue(
             if not ok:
                 with lock:
                     stats["feishu_create_failed"] += 1
+                    upsert_failed_item(
+                        state["updated_failed_items"],
+                        item_key,
+                        item["entry_ts_ms"],
+                        article.get("title") or "",
+                        article.get("link") or "",
+                        "feishu_create_failed",
+                        state["now_ms"],
+                    )
                 return
 
             with lock:
@@ -825,6 +828,19 @@ def run_llm_queue(
                 stats["entries_processed"] += 1
                 stats["entries_new"] += 1
                 state["new_count"] += 1
+        except Exception as exc:
+            with lock:
+                stats["llm_failed"] += 1
+                upsert_failed_item(
+                    state["updated_failed_items"],
+                    item_key,
+                    item["entry_ts_ms"],
+                    article.get("title") or "",
+                    article.get("link") or "",
+                    truncate_text(str(exc), 200),
+                    state["now_ms"],
+                )
+            log(f"[LLM] item failed for {article.get('source') or 'unknown source'}: {exc}")
         finally:
             with lock:
                 if has_in_flight_key:
@@ -867,43 +883,52 @@ def validate_runtime_config() -> List[str]:
         if not value:
             errors.append(f"{label} 未配置。{hint}")
 
-    require(config.FEISHU_APP_ID, "FEISHU_APP_ID", "请填写飞书应用 App ID。")
-    require(config.FEISHU_APP_SECRET, "FEISHU_APP_SECRET", "请填写飞书应用 App Secret。")
+    errors.extend(config.CONFIG_LOAD_ERRORS)
+    require(
+        config.FEISHU_APP_ID,
+        "feishuAppId / FEISHU_APP_ID",
+        "请优先检查仓库根目录的 先填这个.yml；也可以用环境变量 FEISHU_APP_ID 兜底。",
+    )
+    require(
+        config.FEISHU_APP_SECRET,
+        "feishuAppSecret / FEISHU_APP_SECRET",
+        "请优先检查仓库根目录的 先填这个.yml；也可以用环境变量 FEISHU_APP_SECRET 兜底。",
+    )
     require(
         config.FEISHU_NEWS_APP_TOKEN,
-        "FEISHU_NEWS_APP_TOKEN / FEISHU_NEWS_TABLE_LINK",
-        "建议直接填写 FEISHU_NEWS_APP_TOKEN；也可以通过 FEISHU_NEWS_TABLE_LINK 自动解析。",
+        "newsTableLink / FEISHU_NEWS_TABLE_LINK",
+        "请优先在 先填这个.yml 里填写 newsTableLink；环境变量兜底时可提供 FEISHU_NEWS_TABLE_LINK。",
     )
     require(
         config.FEISHU_NEWS_TABLE_ID,
-        "FEISHU_NEWS_TABLE_ID / FEISHU_NEWS_TABLE_LINK",
-        "建议直接填写 FEISHU_NEWS_TABLE_ID；也可以通过 FEISHU_NEWS_TABLE_LINK 自动解析。",
+        "newsTableLink / FEISHU_NEWS_TABLE_LINK",
+        "请优先在 先填这个.yml 里填写 newsTableLink；环境变量兜底时可提供 FEISHU_NEWS_TABLE_LINK。",
     )
     require(
         config.FEISHU_RSS_APP_TOKEN,
-        "FEISHU_RSS_APP_TOKEN / FEISHU_RSS_TABLE_LINK",
-        "建议直接填写 FEISHU_RSS_APP_TOKEN；也可以通过 FEISHU_RSS_TABLE_LINK 自动解析。",
+        "rssTableLink / FEISHU_RSS_TABLE_LINK",
+        "请优先在 先填这个.yml 里填写 rssTableLink；环境变量兜底时可提供 FEISHU_RSS_TABLE_LINK。",
     )
     require(
         config.FEISHU_RSS_TABLE_ID,
-        "FEISHU_RSS_TABLE_ID / FEISHU_RSS_TABLE_LINK",
-        "建议直接填写 FEISHU_RSS_TABLE_ID；也可以通过 FEISHU_RSS_TABLE_LINK 自动解析。",
+        "rssTableLink / FEISHU_RSS_TABLE_LINK",
+        "请优先在 先填这个.yml 里填写 rssTableLink；环境变量兜底时可提供 FEISHU_RSS_TABLE_LINK。",
     )
     require(
         config.FEISHU_PROMPT_DOC_TOKEN,
-        "FEISHU_PROMPT_DOC_TOKEN / FEISHU_PROMPT_DOC_LINK",
-        "建议直接填写 FEISHU_PROMPT_DOC_TOKEN；也可以通过 FEISHU_PROMPT_DOC_LINK 自动解析。",
+        "promptDocLink / FEISHU_PROMPT_DOC_LINK",
+        "请优先在 先填这个.yml 里填写 promptDocLink；环境变量兜底时可提供 FEISHU_PROMPT_DOC_LINK。",
     )
     require(
         config.NVIDIA_API_KEY,
-        "NVIDIA_API_KEY",
-        "当前版本默认使用 NVIDIA API 做新闻分析，未提供其他模型降级路径。",
+        "modelApiKey / NVIDIA_API_KEY",
+        "当前版本只支持 NVIDIA API Key，请优先检查 先填这个.yml 里的 modelApiKey。",
     )
     return errors
 
 
 def log_runtime_config_errors(errors: List[str]) -> None:
-    log("[Config] startup validation failed. The function will stop before fetching RSS.")
+    log("[Config] 启动校验失败，函数不会继续抓取 RSS。")
     for index, error in enumerate(errors, start=1):
         log(f"[Config] {index}. {error}")
 
@@ -917,9 +942,10 @@ def main() -> Dict[str, Any]:
 
         log(
             "[Config] startup validation passed. "
-            f"fetch_interval_minutes={config.DEFAULT_FETCH_INTERVAL_MIN} "
+            f"business_config_source={config.PRIMARY_CONFIG_SOURCE_SUMMARY} "
             f"llm_concurrency={config.LLM_CONCURRENCY}"
         )
+        log("[Config] autoFetchSchedule is compatibility-only. Actual run frequency comes from the FC timer trigger.")
         tenant_token = get_tenant_access_token(config.FEISHU_APP_ID, config.FEISHU_APP_SECRET, config.HTTP_TIMEOUT, config.HTTP_RETRIES)
         system_prompt = get_document_raw_content(
             config.FEISHU_PROMPT_DOC_TOKEN,

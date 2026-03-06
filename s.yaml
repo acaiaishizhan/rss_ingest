@@ -1,4 +1,0 @@
-edition: 3.0.0
-name: rss-ingest
-access: default
-extend: ./填写这里.yml

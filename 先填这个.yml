@@ -1,0 +1,24 @@
+# 这个文件在仓库里只保留空模板。
+# 请只在你自己可控的代码仓库中填写真实值，不要把真实密钥或真实链接提交回公共上游仓库。
+
+# 飞书应用 ID：用于让程序访问你的飞书应用
+feishuAppId: ""
+
+# 飞书应用 Secret：与飞书应用 ID 配套使用
+feishuAppSecret: ""
+
+# 飞书新闻表链接：抓取后的新闻会写入这里
+newsTableLink: ""
+
+# 飞书 RSS 源表链接：程序会从这里读取要抓取的 RSS 源
+rssTableLink: ""
+
+# 飞书 Prompt 文档链接：程序会从这里读取分析提示词
+promptDocLink: ""
+
+# NVIDIA API Key：当前版本只支持 NVIDIA，用于摘要、分类和评分
+modelApiKey: ""
+
+# 兼容保留字段。
+# 当前实际运行频率以阿里云函数计算控制台中的定时触发器为准，这里不再作为主频率入口。
+autoFetchSchedule: "0 0 * * * *"
