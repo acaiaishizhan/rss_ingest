@@ -1,29 +1,28 @@
-  # 只修改双引号里的内容，不要改左侧缩进。
+edition: 3.0.0
+name: rss-ingest
+access: default
+extend: ./s.base.yaml
 
-  # 飞书应用 ID：用于让程序访问你的飞书应用
-  feishuAppId: "cli_a9f0a15a4a389cc9"
-
-  # 飞书应用 Secret：与飞书应用 ID 配套使用
-  feishuAppSecret: "4tXpywVxRb50AimYeJTrKe5Y0tRfpJdR"
-
-  # 飞书新闻表链接：抓取后的新闻会写入这里
-  newsTableLink: "https://kvpfq420mye.feishu.cn/base/CrmHblqNGa3oBNsUW2DckfBjnjc?table=tblxuBtrswdoXHA8&view=vewnihjqcs"
-
-  # 飞书 RSS 源表链接：程序会从这里读取要抓取的 RSS 源
-  rssTableLink: "https://kvpfq420mye.feishu.cn/base/CrmHblqNGa3oBNsUW2DckfBjnjc?table=tblAfFQBZQNqoFT0&view=vewn4FvAiB"
-
-  # 飞书 Prompt 文档链接：程序会从这里读取分析提示词
-  promptDocLink: "https://kvpfq420mye.feishu.cn/docx/FLF7dE66ooYVnmxe775cK29rn3g?from=from_copylink"
-
-  # 模型 API Key：用于摘要、分类和评分
-  modelApiKey: "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"
-
-  # 自动抓取频率：填“多少分钟执行一次”
-  # 推荐填写这些常见值：5、10、15、20、30、60、120、180、240、360、480、720、1440
-  # 例如：
-  # 5 = 每 5 分钟一次
-  # 30 = 每 30 分钟一次
-  # 60 = 每小时一次
-  # 1440 = 每天一次
-  # 如果你填了不在支持范围内的数字，系统会按 60 分钟处理
-  autoFetchIntervalMinutes: 60
+vars:
+    # 鍙慨鏀瑰弻寮曞彿閲岀殑鍐呭锛屼笉瑕佹敼宸︿晶缂╄繘銆?
+    # 椋炰功搴旂敤 ID锛氱敤浜庤绋嬪簭璁块棶浣犵殑椋炰功搴旂敤
+    feishuAppId: "cli_a9f0a15a4a389cc9"
+  
+    # 椋炰功搴旂敤 Secret锛氫笌椋炰功搴旂敤 ID 閰嶅浣跨敤
+    feishuAppSecret: "4tXpywVxRb50AimYeJTrKe5Y0tRfpJdR"
+  
+    # 用于写入新闻结果的飞书多维表链接
+    newsTableLink: "https://kvpfq420mye.feishu.cn/base/CrmHblqNGa3oBNsUW2DckfBjnjc?table=tblxuBtrswdoXHA8&view=vewnihjqcs"
+  
+    # 用于读取 RSS 源配置的飞书多维表链接
+    rssTableLink: "https://kvpfq420mye.feishu.cn/base/CrmHblqNGa3oBNsUW2DckfBjnjc?table=tblAfFQBZQNqoFT0&view=vewn4FvAiB"
+  
+    # 椋炰功 Prompt 鏂囨。閾炬帴锛氱▼搴忎細浠庤繖閲岃鍙栧垎鏋愭彁绀鸿瘝
+    promptDocLink: "https://kvpfq420mye.feishu.cn/docx/FLF7dE66ooYVnmxe775cK29rn3g?from=from_copylink"
+  
+    # 妯″瀷 API Key锛氱敤浜庢憳瑕併€佸垎绫诲拰璇勫垎
+    modelApiKey: "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"
+  
+    # 鑷姩鎶撳彇棰戠巼锛氬～鈥滃灏戝垎閽熸墽琛屼竴娆♀€?  # 鎺ㄨ崘濉啓杩欎簺甯歌鍊硷細5銆?0銆?5銆?0銆?0銆?0銆?20銆?80銆?40銆?60銆?80銆?20銆?440
+    # 渚嬪锛?  # 5 = 姣?5 鍒嗛挓涓€娆?  # 30 = 姣?30 鍒嗛挓涓€娆?  # 60 = 姣忓皬鏃朵竴娆?  # 1440 = 姣忓ぉ涓€娆?  # 濡傛灉浣犲～浜嗕笉鍦ㄦ敮鎸佽寖鍥村唴鐨勬暟瀛楋紝绯荤粺浼氭寜 60 鍒嗛挓澶勭悊
+    autoFetchIntervalMinutes: 60
