@@ -1,25 +1,5 @@
 import os
 import re
-from typing import Any
-
-import yaml
-
-
-CONFIG_FILENAME = "先填这个.yml"
-DEFAULT_AUTO_FETCH_SCHEDULE = "0 0 * * * *"
-
-PRIMARY_CONFIG_FIELDS = {
-    "FEISHU_APP_ID": "feishuAppId",
-    "FEISHU_APP_SECRET": "feishuAppSecret",
-    "FEISHU_NEWS_TABLE_LINK": "newsTableLink",
-    "FEISHU_RSS_TABLE_LINK": "rssTableLink",
-    "FEISHU_PROMPT_DOC_LINK": "promptDocLink",
-    "NVIDIA_API_KEY": "modelApiKey",
-}
-
-CONFIG_FILE_PATH = os.path.join(os.path.dirname(__file__), CONFIG_FILENAME)
-CONFIG_LOAD_ERRORS: list[str] = []
-CONFIG_VALUE_SOURCES: dict[str, str] = {}
 
 
 def load_local_env(filename: str = ".env") -> None:
@@ -49,59 +29,12 @@ def load_local_env(filename: str = ".env") -> None:
             os.environ[name] = value
 
 
-def _normalize_scalar_str(value: Any) -> str:
+def read_env_str(name: str, default: str = "") -> str:
+    value = os.getenv(name)
     if value is None:
-        return ""
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, (int, float, bool)):
-        return str(value).strip()
-    return ""
-
-
-def load_yaml_config(filename: str = CONFIG_FILENAME) -> dict[str, Any]:
-    path = os.path.join(os.path.dirname(__file__), filename)
-    if not os.path.exists(path):
-        CONFIG_LOAD_ERRORS.append(f"仓库根目录缺少 {filename}，请恢复模板文件并填写业务配置。")
-        return {}
-
-    try:
-        with open(path, "r", encoding="utf-8-sig") as yaml_file:
-            loaded = yaml.safe_load(yaml_file) or {}
-    except yaml.YAMLError as exc:
-        CONFIG_LOAD_ERRORS.append(f"{filename} 解析失败，请检查 YAML 缩进和引号：{exc}")
-        return {}
-    except OSError as exc:
-        CONFIG_LOAD_ERRORS.append(f"{filename} 读取失败：{exc}")
-        return {}
-
-    if not isinstance(loaded, dict):
-        CONFIG_LOAD_ERRORS.append(f"{filename} 顶层必须是 key-value 结构。")
-        return {}
-
-    return loaded
-
-
-def _record_value_source(name: str, source: str) -> None:
-    CONFIG_VALUE_SOURCES[name] = source
-
-
-def read_preferred_str(name: str, yaml_key: str | None = None, default: str = "") -> str:
-    if yaml_key:
-        yaml_value = _normalize_scalar_str(_YAML_CONFIG.get(yaml_key))
-        if yaml_value:
-            _record_value_source(name, "yaml")
-            return yaml_value
-
-    env_value = os.getenv(name)
-    if env_value is not None:
-        env_value = env_value.strip()
-        if env_value:
-            _record_value_source(name, "env")
-            return env_value
-
-    _record_value_source(name, "default")
-    return default
+        return default
+    value = value.strip()
+    return value if value else default
 
 
 def read_env_int(name: str, default: int, minimum: int | None = None) -> int:
@@ -120,72 +53,48 @@ def read_env_int(name: str, default: int, minimum: int | None = None) -> int:
     return parsed
 
 
-def describe_primary_config_source() -> str:
-    sources = {
-        CONFIG_VALUE_SOURCES.get(env_name)
-        for env_name in PRIMARY_CONFIG_FIELDS
-        if CONFIG_VALUE_SOURCES.get(env_name) in {"yaml", "env"}
-    }
-    if sources == {"yaml"}:
-        return "YAML"
-    if sources == {"env"}:
-        return "环境变量"
-    if sources == {"yaml", "env"}:
-        return "YAML + 环境变量"
-    return "未读取到业务配置"
+def extract_bitable_app_token(url: str) -> str:
+    match = re.search(r"/base/([A-Za-z0-9_-]+)", url)
+    return match.group(1) if match else ""
 
 
-def _extract_bitable_app_token(url: str) -> str:
-    m = re.search(r"/base/([A-Za-z0-9_-]+)", url)
-    return m.group(1) if m else ""
+def extract_bitable_table_id(url: str) -> str:
+    match = re.search(r"[?&]table=([A-Za-z0-9_-]+)", url)
+    return match.group(1) if match else ""
 
 
-def _extract_bitable_table_id(url: str) -> str:
-    m = re.search(r"[?&]table=([A-Za-z0-9_-]+)", url)
-    return m.group(1) if m else ""
-
-
-def _extract_docx_token(url: str) -> str:
-    m = re.search(r"/docx/([A-Za-z0-9_-]+)", url)
-    return m.group(1) if m else ""
+def extract_docx_token(url: str) -> str:
+    match = re.search(r"/docx/([A-Za-z0-9_-]+)", url)
+    return match.group(1) if match else ""
 
 
 load_local_env()
-_YAML_CONFIG = load_yaml_config()
 
-FEISHU_APP_ID = read_preferred_str("FEISHU_APP_ID", "feishuAppId")
-FEISHU_APP_SECRET = read_preferred_str("FEISHU_APP_SECRET", "feishuAppSecret")
-FEISHU_NEWS_TABLE_LINK = read_preferred_str("FEISHU_NEWS_TABLE_LINK", "newsTableLink")
-FEISHU_RSS_TABLE_LINK = read_preferred_str("FEISHU_RSS_TABLE_LINK", "rssTableLink")
-FEISHU_PROMPT_DOC_LINK = read_preferred_str("FEISHU_PROMPT_DOC_LINK", "promptDocLink")
-NVIDIA_API_KEY = read_preferred_str("NVIDIA_API_KEY", "modelApiKey")
+FEISHU_APP_ID = read_env_str("FEISHU_APP_ID")
+FEISHU_APP_SECRET = read_env_str("FEISHU_APP_SECRET")
+FEISHU_NEWS_TABLE_LINK = read_env_str("FEISHU_NEWS_TABLE_LINK")
+FEISHU_RSS_TABLE_LINK = read_env_str("FEISHU_RSS_TABLE_LINK")
+FEISHU_PROMPT_DOC_LINK = read_env_str("FEISHU_PROMPT_DOC_LINK")
+NVIDIA_API_KEY = read_env_str("NVIDIA_API_KEY")
 
-FEISHU_NEWS_APP_TOKEN = _extract_bitable_app_token(FEISHU_NEWS_TABLE_LINK)
-FEISHU_NEWS_TABLE_ID = _extract_bitable_table_id(FEISHU_NEWS_TABLE_LINK)
-FEISHU_RSS_APP_TOKEN = _extract_bitable_app_token(FEISHU_RSS_TABLE_LINK)
-FEISHU_RSS_TABLE_ID = _extract_bitable_table_id(FEISHU_RSS_TABLE_LINK)
-FEISHU_PROMPT_DOC_TOKEN = _extract_docx_token(FEISHU_PROMPT_DOC_LINK)
+FEISHU_NEWS_APP_TOKEN = extract_bitable_app_token(FEISHU_NEWS_TABLE_LINK)
+FEISHU_NEWS_TABLE_ID = extract_bitable_table_id(FEISHU_NEWS_TABLE_LINK)
+FEISHU_RSS_APP_TOKEN = extract_bitable_app_token(FEISHU_RSS_TABLE_LINK)
+FEISHU_RSS_TABLE_ID = extract_bitable_table_id(FEISHU_RSS_TABLE_LINK)
+FEISHU_PROMPT_DOC_TOKEN = extract_docx_token(FEISHU_PROMPT_DOC_LINK)
 
-# Compatibility field only. Actual run frequency is controlled by the FC timer trigger.
-AUTO_FETCH_SCHEDULE_COMPAT = read_preferred_str(
-    "AUTO_FETCH_SCHEDULE",
-    "autoFetchSchedule",
-    DEFAULT_AUTO_FETCH_SCHEDULE,
-)
+PRIMARY_CONFIG_SOURCE_SUMMARY = "env"
 
-CONFIG_FILE_PRESENT = os.path.exists(CONFIG_FILE_PATH)
-PRIMARY_CONFIG_SOURCE_SUMMARY = describe_primary_config_source()
-
-NEWS_FIELD_TITLE = "标题"
-NEWS_FIELD_SCORE = "AI打分"
-NEWS_FIELD_CATEGORIES = "分类"
-NEWS_FIELD_SUMMARY = "总结"
-NEWS_FIELD_PUBLISHED_MS = "发布时间"
-NEWS_FIELD_SOURCE = "来源"
-NEWS_FIELD_FULL_CONTENT = "全文"
+NEWS_FIELD_TITLE = "\u6807\u9898"
+NEWS_FIELD_SCORE = "AI\u6253\u5206"
+NEWS_FIELD_CATEGORIES = "\u5206\u7c7b"
+NEWS_FIELD_SUMMARY = "\u603b\u7ed3"
+NEWS_FIELD_PUBLISHED_MS = "\u53d1\u5e03\u65f6\u95f4"
+NEWS_FIELD_SOURCE = "\u6765\u6e90"
+NEWS_FIELD_FULL_CONTENT = "\u5168\u6587"
 NEWS_FIELD_ITEM_KEY = "item_key"
-NEWS_FIELD_CREATED_TIME = "创建时间"
-NEWS_FIELD_READ = "已读"
+NEWS_FIELD_CREATED_TIME = "\u521b\u5efa\u65f6\u95f4"
+NEWS_FIELD_READ = "\u5df2\u8bfb"
 RSS_FIELD_NAME = "name"
 RSS_FIELD_FEED_URL = "feed_url"
 RSS_FIELD_TYPE = "type"

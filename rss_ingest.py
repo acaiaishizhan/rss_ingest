@@ -883,46 +883,45 @@ def validate_runtime_config() -> List[str]:
         if not value:
             errors.append(f"{label} 未配置。{hint}")
 
-    errors.extend(config.CONFIG_LOAD_ERRORS)
     require(
         config.FEISHU_APP_ID,
-        "feishuAppId / FEISHU_APP_ID",
-        "请优先检查仓库根目录的 先填这个.yml；也可以用环境变量 FEISHU_APP_ID 兜底。",
+        "FEISHU_APP_ID",
+        "请在函数配置的环境变量中填写 FEISHU_APP_ID。",
     )
     require(
         config.FEISHU_APP_SECRET,
-        "feishuAppSecret / FEISHU_APP_SECRET",
-        "请优先检查仓库根目录的 先填这个.yml；也可以用环境变量 FEISHU_APP_SECRET 兜底。",
+        "FEISHU_APP_SECRET",
+        "请在函数配置的环境变量中填写 FEISHU_APP_SECRET。",
     )
     require(
         config.FEISHU_NEWS_APP_TOKEN,
-        "newsTableLink / FEISHU_NEWS_TABLE_LINK",
-        "请优先在 先填这个.yml 里填写 newsTableLink；环境变量兜底时可提供 FEISHU_NEWS_TABLE_LINK。",
+        "FEISHU_NEWS_TABLE_LINK",
+        "请在函数配置的环境变量中填写完整的飞书新闻表链接 FEISHU_NEWS_TABLE_LINK。",
     )
     require(
         config.FEISHU_NEWS_TABLE_ID,
-        "newsTableLink / FEISHU_NEWS_TABLE_LINK",
-        "请优先在 先填这个.yml 里填写 newsTableLink；环境变量兜底时可提供 FEISHU_NEWS_TABLE_LINK。",
+        "FEISHU_NEWS_TABLE_LINK",
+        "请确认 FEISHU_NEWS_TABLE_LINK 是完整的飞书多维表链接，并包含 table 参数。",
     )
     require(
         config.FEISHU_RSS_APP_TOKEN,
-        "rssTableLink / FEISHU_RSS_TABLE_LINK",
-        "请优先在 先填这个.yml 里填写 rssTableLink；环境变量兜底时可提供 FEISHU_RSS_TABLE_LINK。",
+        "FEISHU_RSS_TABLE_LINK",
+        "请在函数配置的环境变量中填写完整的飞书 RSS 源表链接 FEISHU_RSS_TABLE_LINK。",
     )
     require(
         config.FEISHU_RSS_TABLE_ID,
-        "rssTableLink / FEISHU_RSS_TABLE_LINK",
-        "请优先在 先填这个.yml 里填写 rssTableLink；环境变量兜底时可提供 FEISHU_RSS_TABLE_LINK。",
+        "FEISHU_RSS_TABLE_LINK",
+        "请确认 FEISHU_RSS_TABLE_LINK 是完整的飞书多维表链接，并包含 table 参数。",
     )
     require(
         config.FEISHU_PROMPT_DOC_TOKEN,
-        "promptDocLink / FEISHU_PROMPT_DOC_LINK",
-        "请优先在 先填这个.yml 里填写 promptDocLink；环境变量兜底时可提供 FEISHU_PROMPT_DOC_LINK。",
+        "FEISHU_PROMPT_DOC_LINK",
+        "请在函数配置的环境变量中填写完整的飞书文档链接 FEISHU_PROMPT_DOC_LINK。",
     )
     require(
         config.NVIDIA_API_KEY,
-        "modelApiKey / NVIDIA_API_KEY",
-        "当前版本只支持 NVIDIA API Key，请优先检查 先填这个.yml 里的 modelApiKey。",
+        "NVIDIA_API_KEY",
+        "当前版本只支持 NVIDIA API Key，请在函数配置的环境变量中填写 NVIDIA_API_KEY。",
     )
     return errors
 
@@ -945,7 +944,7 @@ def main() -> Dict[str, Any]:
             f"business_config_source={config.PRIMARY_CONFIG_SOURCE_SUMMARY} "
             f"llm_concurrency={config.LLM_CONCURRENCY}"
         )
-        log("[Config] autoFetchSchedule is compatibility-only. Actual run frequency comes from the FC timer trigger.")
+        log("[Config] Actual run frequency comes from the FC timer trigger.")
         tenant_token = get_tenant_access_token(config.FEISHU_APP_ID, config.FEISHU_APP_SECRET, config.HTTP_TIMEOUT, config.HTTP_RETRIES)
         system_prompt = get_document_raw_content(
             config.FEISHU_PROMPT_DOC_TOKEN,
