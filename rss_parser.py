@@ -8,6 +8,17 @@ import feedparser
 import requests
 
 
+def normalize_entry(entry: Any) -> Dict[str, Any]:
+    if isinstance(entry, dict):
+        return entry
+    if hasattr(entry, "items"):
+        try:
+            return dict(entry.items())
+        except Exception:
+            return {}
+    return {}
+
+
 def fetch_feed(url: str, timeout: int, retries: int, headers: Optional[Dict[str, str]] = None) -> feedparser.FeedParserDict:
     last_err: Optional[Exception] = None
     for attempt in range(retries):
@@ -16,7 +27,7 @@ def fetch_feed(url: str, timeout: int, retries: int, headers: Optional[Dict[str,
             if resp.status_code != 200:
                 raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
             feed = feedparser.parse(resp.content)
-            if feed.bozo:
+            if feed.bozo and not (feed.entries or []):
                 raise RuntimeError(f"Feed parse error: {feed.bozo_exception}")
             return feed
         except Exception as exc:
@@ -26,18 +37,24 @@ def fetch_feed(url: str, timeout: int, retries: int, headers: Optional[Dict[str,
 
 
 def entry_published_ts(entry: Dict[str, Any]) -> int:
+    entry = normalize_entry(entry)
     tm = entry.get("published_parsed") or entry.get("updated_parsed")
     if tm:
-        return int(calendar.timegm(tm))
+        try:
+            return int(calendar.timegm(tm))
+        except Exception:
+            return 0
     return 0
 
 
 def entry_text_content(entry: Dict[str, Any]) -> str:
+    entry = normalize_entry(entry)
     content = entry.get("content")
     if isinstance(content, list) and content:
         first = content[0]
-        if isinstance(first, dict) and first.get("value"):
-            return str(first.get("value"))
+        first_entry = normalize_entry(first)
+        if first_entry.get("value"):
+            return str(first_entry.get("value"))
     summary = entry.get("summary") or entry.get("description")
     if summary:
         return str(summary)
@@ -45,6 +62,7 @@ def entry_text_content(entry: Dict[str, Any]) -> str:
 
 
 def build_item_key(entry: Dict[str, Any], strategy: str, content_hash_algo: str) -> str:
+    entry = normalize_entry(entry)
     strategy = (strategy or "").strip().lower()
     if strategy == "guid":
         return str(entry.get("id") or entry.get("guid") or "").strip()

@@ -18,9 +18,14 @@ from feishu_client import (
     list_bitable_records,
     update_bitable_record_fields,
 )
-from rss_parser import build_item_key, entry_published_ts, entry_text_content, fetch_feed
+from rss_parser import build_item_key, entry_published_ts, entry_text_content, fetch_feed, normalize_entry
 
 FAILED_CATEGORIES = {"调用失败", "调用异常", "解析失败", "JSON解析失败", "异常"}
+SECONDARY_NVIDIA_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
+FALLBACK_LLM_MODEL = "deepseek/deepseek-chat:free"
+LLM_MAX_RETRY = 3
+RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+NON_RETRIABLE_STATUS_CODES = {400, 401, 403}
 
 def log(msg: str) -> None:
     try:
@@ -187,8 +192,113 @@ def derive_overall_status(consecutive_fail: int, enabled: bool) -> str:
     return config.STATUS_OK
 
 
-def nvidia_headers() -> Dict[str, str]:
-    return {"Content-Type": "application/json", "Authorization": f"Bearer {config.NVIDIA_API_KEY}"}
+def llm_failure(summary: str = "", category: str = "调用异常") -> Dict[str, Any]:
+    return {
+        "categories": [category],
+        "score": 0.0,
+        "summary": summary,
+        "title_zh": "",
+        "one_liner": "",
+        "points": [],
+    }
+
+
+def is_failed_analysis(analysis: Dict[str, Any]) -> bool:
+    categories = analysis.get("categories") or []
+    if not isinstance(categories, list):
+        categories = [str(categories)]
+    return any(c in FAILED_CATEGORIES for c in categories)
+
+
+def build_llm_headers(api_key: str) -> Dict[str, str]:
+    return {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+
+
+def normalize_openai_base_url(base_url: str) -> str:
+    url = (base_url or "").strip().rstrip("/")
+    if not url:
+        return ""
+    if url.endswith("/chat/completions"):
+        return url
+    return f"{url}/chat/completions"
+
+
+def call_openai_compatible(
+    service_name: str,
+    base_url: str,
+    api_key: str,
+    model_name: str,
+    prompt: str,
+) -> tuple[Dict[str, Any], str]:
+    if not api_key:
+        return llm_failure(f"{service_name} missing API key", category="调用失败"), "missing api key"
+
+    url = normalize_openai_base_url(base_url)
+    if not url:
+        return llm_failure(f"{service_name} missing base url", category="调用失败"), "missing base url"
+
+    payload: Dict[str, Any] = {
+        "model": model_name,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.6,
+        "top_p": 0.7,
+        "max_tokens": 4096,
+        "stream": False,
+    }
+    last_reason = ""
+
+    for attempt in range(LLM_MAX_RETRY):
+        try:
+            resp = requests.post(url, headers=build_llm_headers(api_key), json=payload, timeout=300)
+        except Exception as exc:
+            last_reason = f"exception: {truncate_text(str(exc), 120)}"
+            if attempt < LLM_MAX_RETRY - 1:
+                time.sleep(float(2 ** attempt))
+                continue
+            return llm_failure(f"{service_name} {last_reason}"), last_reason
+
+        status = resp.status_code
+        if status == 200:
+            try:
+                data = resp.json()
+            except Exception as exc:
+                reason = f"invalid json: {truncate_text(str(exc), 120)}"
+                return llm_failure(f"{service_name} {reason}"), reason
+
+            choices = data.get("choices") or []
+            if not choices:
+                reason = "empty choices"
+                return llm_failure(f"{service_name} {reason}"), reason
+
+            message = choices[0].get("message") or {}
+            raw_text = (message.get("content") or "").strip()
+            if raw_text:
+                raw_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.S)
+                if "<think>" in raw_text:
+                    raw_text = raw_text.split("<think>", 1)[0]
+                raw_text = raw_text.strip()
+
+            result = parse_llm_json(raw_text, service_name)
+            if result is None:
+                reason = "json parse failed"
+                return llm_failure(f"{service_name} {reason}", category="JSON解析失败"), reason
+            return result, ""
+
+        if status in NON_RETRIABLE_STATUS_CODES:
+            reason = f"HTTP {status}"
+            return llm_failure(f"{service_name} {reason}", category="调用失败"), reason
+
+        if status in RETRIABLE_STATUS_CODES:
+            last_reason = f"HTTP {status}"
+            if attempt < LLM_MAX_RETRY - 1:
+                time.sleep(float(2 ** attempt))
+                continue
+            return llm_failure(f"{service_name} {last_reason}"), last_reason
+
+        reason = f"HTTP {status}"
+        return llm_failure(f"{service_name} {reason}", category="调用失败"), reason
+
+    return llm_failure(f"{service_name} {last_reason}"), (last_reason or "unknown error")
 
 
 def build_prompt(article: Dict[str, Any], system_prompt: str) -> str:
@@ -227,68 +337,46 @@ def parse_llm_json(raw_text: str, service: str) -> Optional[Dict[str, Any]]:
         return None
  
 def analyze_with_nvidia(article: Dict[str, Any], system_prompt: str) -> Dict[str, Any]:
-    if not config.NVIDIA_API_KEY:
-        log("[NVIDIA] error: missing NVIDIA API Key")
-        return {"categories": ["调用失败"], "score": 0.0, "summary": "missing NVIDIA API Key", "title_zh": "", "one_liner": "", "points": []}
-
     prompt = build_prompt(article, system_prompt)
-    url = "https://integrate.api.nvidia.com/v1/chat/completions"
-    payload: Dict[str, Any] = {
-        "model": "qwen/qwen3-next-80b-a3b-instruct",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.6,
-        "top_p": 0.7,
-        "max_tokens": 4096,
-        "stream": False,
-    }
+    nvidia_models: List[str] = []
+    for name in [config.NVIDIA_MODEL, SECONDARY_NVIDIA_MODEL]:
+        model = str(name or "").strip()
+        if model and model not in nvidia_models:
+            nvidia_models.append(model)
 
-    last_err: Optional[Exception] = None
-    last_status_type: Optional[str] = None
-    last_status_detail = ""
-    for attempt in range(config.NVIDIA_RETRIES):
-        try:
-            resp = requests.post(url, headers=nvidia_headers(), json=payload, timeout=300)
-            if resp.status_code in (401, 403):
-                log(f"[NVIDIA] error: HTTP {resp.status_code}")
-                return {"categories": ["调用失败"], "score": 0.0, "summary": "", "title_zh": "", "one_liner": "", "points": []}
-            if resp.status_code in (429, 500, 502, 503, 504):
-                last_status_type = "rate_limit" if resp.status_code == 429 else "server_error"
-                last_status_detail = f"HTTP {resp.status_code}"
-                time.sleep(1.2 * (attempt + 1))
-                continue
-            if resp.status_code != 200:
-                return {"categories": ["调用失败"], "score": 0.0, "summary": "", "title_zh": "", "one_liner": "", "points": []}
-
-            data = resp.json()
-            choices = data.get("choices") or []
-            if not choices:
-                return {"categories": ["调用失败"], "score": 0.0, "summary": "", "title_zh": "", "one_liner": "", "points": []}
-            message = choices[0].get("message") or {}
-            raw_text = (message.get("content") or "").strip()
-            if raw_text:
-                # Drop <think> blocks to keep final JSON only (align with test.py behavior)
-                raw_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.S)
-                if "<think>" in raw_text:
-                    raw_text = raw_text.split("<think>", 1)[0]
-                raw_text = raw_text.strip()
-            result = parse_llm_json(raw_text, "NVIDIA")
-            if result is None:
-                log(f"[NVIDIA] parse failed, raw={truncate_text(raw_text, 300)}")
-                return {"categories": ["调用失败"], "score": 0.0, "summary": "", "title_zh": "", "one_liner": "", "points": []}
+    nvidia_errors: List[str] = []
+    nvidia_base = "https://integrate.api.nvidia.com/v1"
+    for model_name in nvidia_models:
+        result, reason = call_openai_compatible("NVIDIA", nvidia_base, config.NVIDIA_API_KEY, model_name, prompt)
+        if not is_failed_analysis(result):
             return result
-        except Exception as exc:
-            last_err = exc
-            if "timeout" in str(exc).lower():
-                last_status_type = "timeout"
-            time.sleep(1.0 + attempt)
+        if reason:
+            nvidia_errors.append(f"{model_name}: {reason}")
+            if reason.startswith("HTTP 401") or reason.startswith("HTTP 403"):
+                break
 
-    if last_status_type == "rate_limit":
-        log(f"[NVIDIA] error: {last_status_detail or 'HTTP 429'}")
-    elif last_status_type == "server_error":
-        log(f"[NVIDIA] error: {last_status_detail or 'HTTP 5xx'}")
-    elif last_status_type == "timeout":
-        log(f"[NVIDIA] error: {str(last_err) if last_err else 'timeout'}")
-    return {"categories": ["调用异常"], "score": 0.0, "summary": str(last_err) if last_err else "", "title_zh": "", "one_liner": "", "points": []}
+    fallback_errors: List[str] = []
+    if config.FALLBACK_LLM_API_KEY:
+        fallback_result, fallback_reason = call_openai_compatible(
+            "Fallback",
+            config.FALLBACK_LLM_BASE_URL,
+            config.FALLBACK_LLM_API_KEY,
+            FALLBACK_LLM_MODEL,
+            prompt,
+        )
+        if not is_failed_analysis(fallback_result):
+            return fallback_result
+        if fallback_reason:
+            fallback_errors.append(fallback_reason)
+    else:
+        fallback_errors.append("missing FALLBACK_LLM_API_KEY")
+
+    summary = (
+        f"NVIDIA失败[{'; '.join(nvidia_errors) if nvidia_errors else 'unknown'}]; "
+        f"Fallback失败[{'; '.join(fallback_errors)}]"
+    )
+    log(f"[LLM] {summary}")
+    return llm_failure(summary=summary)
 
 
 def normalize_points(points: Any) -> List[str]:
@@ -625,10 +713,22 @@ def split_sources_and_queue(
         if config.MAX_ENTRIES_PER_FEED and len(entries) > config.MAX_ENTRIES_PER_FEED:
             entries = entries[: config.MAX_ENTRIES_PER_FEED]
 
+        normalized_entries: List[Dict[str, Any]] = []
+        for raw_entry in entries:
+            entry = normalize_entry(raw_entry)
+            if not entry:
+                log(f"[RSS] skip malformed entry in {source.get('name') or source.get('feed_url')}")
+                continue
+            normalized_entries.append(entry)
+
         failed_items = parse_failed_items(source.get("failed_items"))
         entry_map: Dict[str, Dict[str, Any]] = {}
-        for entry in entries:
-            entry_key = build_item_key(entry, source.get("item_id_strategy"), source.get("content_hash_algo"))
+        for entry in normalized_entries:
+            try:
+                entry_key = build_item_key(entry, source.get("item_id_strategy"), source.get("content_hash_algo"))
+            except Exception as exc:
+                log(f"[RSS] item key parse failed in {source.get('name') or source.get('feed_url')}: {exc}")
+                continue
             if entry_key:
                 entry_map[entry_key] = entry
 
@@ -667,15 +767,20 @@ def split_sources_and_queue(
                     continue
                 retry_budget -= 1
 
-                entry_ts = entry_published_ts(entry)
-                entry_ts_ms = entry_ts * 1000 if entry_ts else 0
-                article = {
-                    "title": entry.get("title") or "",
-                    "content": entry_text_content(entry),
-                    "link": entry.get("link") or "",
-                    "published": entry_ts,
-                    "source": source.get("name") or source.get("feed_url"),
-                }
+                try:
+                    entry_ts = entry_published_ts(entry)
+                    entry_ts_ms = entry_ts * 1000 if entry_ts else 0
+                    article = {
+                        "title": entry.get("title") or "",
+                        "content": entry_text_content(entry),
+                        "link": entry.get("link") or "",
+                        "published": entry_ts,
+                        "source": source.get("name") or source.get("feed_url"),
+                    }
+                except Exception as exc:
+                    item["last_error"] = f"entry_parse_error: {truncate_text(str(exc), 120)}"
+                    updated_failed_items.append(item)
+                    continue
 
                 queued = enqueue_unique_item(
                     queue,
@@ -699,48 +804,52 @@ def split_sources_and_queue(
                     latest_pub_ms = entry_ts_ms
                     latest_key = item_key
 
-        for entry in entries:
-            entry_ts = entry_published_ts(entry)
-            entry_ts_ms = entry_ts * 1000 if entry_ts else 0
-            if entry_ts_ms and cutoff_ms and entry_ts_ms <= cutoff_ms:
-                continue
+        for entry in normalized_entries:
+            try:
+                entry_ts = entry_published_ts(entry)
+                entry_ts_ms = entry_ts * 1000 if entry_ts else 0
+                if entry_ts_ms and cutoff_ms and entry_ts_ms <= cutoff_ms:
+                    continue
 
-            item_key = build_item_key(entry, source.get("item_id_strategy"), source.get("content_hash_algo"))
-            if not item_key:
-                continue
-            if item_key in processed_keys:
-                continue
-            if item_key in existing_keys:
-                continue
+                item_key = build_item_key(entry, source.get("item_id_strategy"), source.get("content_hash_algo"))
+                if not item_key:
+                    continue
+                if item_key in processed_keys:
+                    continue
+                if item_key in existing_keys:
+                    continue
 
-            article = {
-                "title": entry.get("title") or "",
-                "content": entry_text_content(entry),
-                "link": entry.get("link") or "",
-                "published": entry_ts,
-                "source": source.get("name") or source.get("feed_url"),
-            }
+                article = {
+                    "title": entry.get("title") or "",
+                    "content": entry_text_content(entry),
+                    "link": entry.get("link") or "",
+                    "published": entry_ts,
+                    "source": source.get("name") or source.get("feed_url"),
+                }
 
-            queued = enqueue_unique_item(
-                queue,
-                queued_keys,
-                state,
-                {
-                    "source_id": source["record_id"],
-                    "item_key": item_key,
-                    "article": article,
-                    "entry_ts": entry_ts,
-                    "entry_ts_ms": entry_ts_ms,
-                    "from_failed": False,
-                },
-            )
-            processed_keys.add(item_key)
-            if not queued:
+                queued = enqueue_unique_item(
+                    queue,
+                    queued_keys,
+                    state,
+                    {
+                        "source_id": source["record_id"],
+                        "item_key": item_key,
+                        "article": article,
+                        "entry_ts": entry_ts,
+                        "entry_ts_ms": entry_ts_ms,
+                        "from_failed": False,
+                    },
+                )
+                processed_keys.add(item_key)
+                if not queued:
+                    continue
+
+                if entry_ts_ms > latest_pub_ms:
+                    latest_pub_ms = entry_ts_ms
+                    latest_key = item_key
+            except Exception as entry_exc:
+                log(f"[RSS] skip entry due to parse error in {source.get('name') or source.get('feed_url')}: {entry_exc}")
                 continue
-
-            if entry_ts_ms > latest_pub_ms:
-                latest_pub_ms = entry_ts_ms
-                latest_key = item_key
 
         state["latest_pub_ms"] = latest_pub_ms
         state["latest_key"] = latest_key
@@ -918,11 +1027,10 @@ def validate_runtime_config() -> List[str]:
         "FEISHU_PROMPT_DOC_LINK",
         "请在函数配置的环境变量中填写完整的飞书文档链接 FEISHU_PROMPT_DOC_LINK。",
     )
-    require(
-        config.NVIDIA_API_KEY,
-        "NVIDIA_API_KEY",
-        "当前版本只支持 NVIDIA API Key，请在函数配置的环境变量中填写 NVIDIA_API_KEY。",
-    )
+    if not config.NVIDIA_API_KEY and not config.FALLBACK_LLM_API_KEY:
+        errors.append(
+            "至少需要配置 NVIDIA_API_KEY 或 FALLBACK_LLM_API_KEY 其中之一。"
+        )
     return errors
 
 

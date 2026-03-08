@@ -62,6 +62,60 @@ def test_split_sources_and_queue_dedupes_same_key_in_single_feed(monkeypatch):
     assert stats["queue_total"] == 1
 
 
+def test_split_sources_and_queue_skips_malformed_entry(monkeypatch):
+    monkeypatch.setattr(rss_ingest, "update_bitable_record_fields", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        rss_ingest,
+        "fetch_feed",
+        lambda *args, **kwargs: SimpleNamespace(entries=[{"id": "ok"}, object()]),
+    )
+    sources = [
+        {
+            "feed_url": "https://example.com/rss",
+            "enabled": True,
+            "record_id": "r1",
+            "name": "feed-1",
+            "item_id_strategy": "guid",
+            "content_hash_algo": "md5",
+            "last_item_pub_time": 0,
+            "last_fetch_time": 0,
+            "consecutive_fail_count": 0,
+            "failed_items": None,
+        }
+    ]
+
+    queue, source_states, stats = split_sources_and_queue(sources, existing_keys=set(), tenant_token="t")
+
+    assert [item["item_key"] for item in queue] == ["ok"]
+    assert source_states["r1"]["pending_count"] == 1
+    assert stats["queue_total"] == 1
+
+
+def test_analyze_with_nvidia_fallback_to_openai_compatible(monkeypatch):
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEY", "n-key")
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_MODEL", "model-primary")
+    monkeypatch.setattr(rss_ingest.config, "FALLBACK_LLM_API_KEY", "f-key")
+    monkeypatch.setattr(rss_ingest.config, "FALLBACK_LLM_BASE_URL", "https://fallback.example.com/v1")
+
+    calls = []
+
+    def fake_call(service_name, base_url, api_key, model_name, prompt):
+        calls.append((service_name, model_name))
+        if service_name == "NVIDIA":
+            return (
+                {"categories": ["调用异常"], "score": 0.0, "summary": "", "title_zh": "", "one_liner": "", "points": []},
+                "HTTP 500",
+            )
+        return {"categories": ["news"], "score": 1.0, "one_liner": "", "points": []}, ""
+
+    monkeypatch.setattr(rss_ingest, "call_openai_compatible", fake_call)
+
+    result = rss_ingest.analyze_with_nvidia({"title": "t", "content": "c"}, "prompt")
+
+    assert result["categories"] == ["news"]
+    assert any(service == "Fallback" for service, _ in calls)
+
+
 def test_run_llm_queue_skips_duplicate_writes(monkeypatch):
     create_calls = []
     update_calls = []
