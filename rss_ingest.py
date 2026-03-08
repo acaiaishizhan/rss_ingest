@@ -262,13 +262,19 @@ def call_openai_compatible(
             try:
                 data = resp.json()
             except Exception as exc:
-                reason = f"invalid json: {truncate_text(str(exc), 120)}"
-                return llm_failure(f"{service_name} {reason}"), reason
+                last_reason = f"invalid json: {truncate_text(str(exc), 120)}"
+                if attempt < LLM_MAX_RETRY - 1:
+                    time.sleep(float(2 ** attempt))
+                    continue
+                return llm_failure(f"{service_name} {last_reason}", category="JSON解析失败"), last_reason
 
             choices = data.get("choices") or []
             if not choices:
-                reason = "empty choices"
-                return llm_failure(f"{service_name} {reason}"), reason
+                last_reason = "empty choices"
+                if attempt < LLM_MAX_RETRY - 1:
+                    time.sleep(float(2 ** attempt))
+                    continue
+                return llm_failure(f"{service_name} {last_reason}", category="JSON解析失败"), last_reason
 
             message = choices[0].get("message") or {}
             raw_text = (message.get("content") or "").strip()
@@ -280,8 +286,11 @@ def call_openai_compatible(
 
             result = parse_llm_json(raw_text, service_name)
             if result is None:
-                reason = "json parse failed"
-                return llm_failure(f"{service_name} {reason}", category="JSON解析失败"), reason
+                last_reason = "json parse failed"
+                if attempt < LLM_MAX_RETRY - 1:
+                    time.sleep(float(2 ** attempt))
+                    continue
+                return llm_failure(f"{service_name} {last_reason}", category="JSON解析失败"), last_reason
             return result, ""
 
         if status in NON_RETRIABLE_STATUS_CODES:

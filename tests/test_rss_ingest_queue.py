@@ -116,6 +116,44 @@ def test_analyze_with_nvidia_fallback_to_openai_compatible(monkeypatch):
     assert any(service == "Fallback" for service, _ in calls)
 
 
+def test_call_openai_compatible_retries_on_empty_json(monkeypatch):
+    monkeypatch.setattr(rss_ingest, "LLM_MAX_RETRY", 3)
+    monkeypatch.setattr(rss_ingest.time, "sleep", lambda *_args, **_kwargs: None)
+
+    class FakeResp:
+        def __init__(self, payload):
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    responses = [
+        FakeResp({"choices": [{"message": {"content": ""}}]}),
+        FakeResp({"choices": [{"message": {"content": "{\"categories\":[\"news\"],\"score\":1,\"one_liner\":\"\",\"points\":[]}"}}]}),
+    ]
+    call_count = {"n": 0}
+
+    def fake_post(*_args, **_kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return responses[idx]
+
+    monkeypatch.setattr(rss_ingest.requests, "post", fake_post)
+
+    result, reason = rss_ingest.call_openai_compatible(
+        "NVIDIA",
+        "https://example.com/v1",
+        "k",
+        "m",
+        "prompt",
+    )
+
+    assert reason == ""
+    assert result["categories"] == ["news"]
+    assert call_count["n"] == 2
+
+
 def test_run_llm_queue_skips_duplicate_writes(monkeypatch):
     create_calls = []
     update_calls = []
