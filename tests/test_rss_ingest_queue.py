@@ -154,6 +154,45 @@ def test_call_openai_compatible_retries_on_empty_json(monkeypatch):
     assert call_count["n"] == 2
 
 
+def test_call_openai_compatible_retries_on_invalid_action(monkeypatch):
+    monkeypatch.setattr(rss_ingest, "LLM_MAX_RETRY", 3)
+    monkeypatch.setattr(rss_ingest.time, "sleep", lambda *_args, **_kwargs: None)
+
+    class FakeResp:
+        def __init__(self, payload):
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    responses = [
+        FakeResp({"choices": [{"message": {"content": "{\"action\":\"skip\",\"categories\":[\"news\"],\"score\":1,\"one_liner\":\"\",\"points\":[]}"}}]}),
+        FakeResp({"choices": [{"message": {"content": "{\"action\":\"ingest\",\"categories\":[\"news\"],\"score\":1,\"one_liner\":\"\",\"points\":[]}"}}]}),
+    ]
+    call_count = {"n": 0}
+
+    def fake_post(*_args, **_kwargs):
+        idx = call_count["n"]
+        call_count["n"] += 1
+        return responses[idx]
+
+    monkeypatch.setattr(rss_ingest.requests, "post", fake_post)
+
+    result, reason = rss_ingest.call_openai_compatible(
+        "NVIDIA",
+        "https://example.com/v1",
+        "k",
+        "m",
+        "prompt",
+    )
+
+    assert reason == ""
+    assert result["action"] == "ingest"
+    assert result["categories"] == ["news"]
+    assert call_count["n"] == 2
+
+
 def test_run_llm_queue_skips_duplicate_writes(monkeypatch):
     create_calls = []
     update_calls = []
@@ -225,6 +264,70 @@ def test_run_llm_queue_skips_duplicate_writes(monkeypatch):
     assert source_states["r1"]["new_count"] == 1
     assert source_states["r1"]["persisted"] is True
     assert "dup" in existing_keys
+
+
+def test_run_llm_queue_filters_pass_action(monkeypatch):
+    create_calls = []
+    update_calls = []
+
+    monkeypatch.setattr(rss_ingest.config, "LLM_CONCURRENCY", 1)
+    monkeypatch.setattr(
+        rss_ingest,
+        "analyze_with_nvidia",
+        lambda article, prompt: {"action": "pass", "reason": "命中过滤规则"},
+    )
+
+    def fake_create(*args, **kwargs):
+        create_calls.append((args, kwargs))
+        return True, "news-record"
+
+    def fake_update(*args, **kwargs):
+        update_calls.append(args[3])
+        return True
+
+    monkeypatch.setattr(rss_ingest, "create_bitable_record_with_id", fake_create)
+    monkeypatch.setattr(rss_ingest, "update_bitable_record_fields", fake_update)
+
+    source_states = {
+        "r1": {
+            "source": {"record_id": "r1", "name": "feed-1", "feed_url": "https://example.com/rss"},
+            "now_ms": 123,
+            "latest_pub_ms": 456,
+            "latest_key": "k1",
+            "updated_failed_items": [],
+            "new_count": 0,
+            "pending_count": 1,
+            "persisted": False,
+        }
+    }
+    queue = [
+        {
+            "source_id": "r1",
+            "item_key": "k1",
+            "article": {"title": "t", "content": "x", "link": "", "published": 0, "source": "feed-1"},
+            "entry_ts": 0,
+            "entry_ts_ms": 0,
+            "from_failed": False,
+        }
+    ]
+    stats = {
+        "llm_success": 0,
+        "llm_failed": 0,
+        "feishu_create_failed": 0,
+        "entries_processed": 0,
+        "entries_new": 0,
+    }
+
+    run_llm_queue(queue, source_states, "tenant", set(), "prompt", stats)
+
+    assert stats["llm_filtered"] == 1
+    assert stats["llm_success"] == 0
+    assert stats["llm_failed"] == 0
+    assert stats["entries_new"] == 0
+    assert create_calls == []
+    assert update_calls == ["r1"]
+    assert source_states["r1"]["pending_count"] == 0
+    assert source_states["r1"]["persisted"] is True
 
 
 def test_run_llm_queue_persists_finished_source_before_slow_source(monkeypatch):

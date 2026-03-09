@@ -210,6 +210,14 @@ def is_failed_analysis(analysis: Dict[str, Any]) -> bool:
     return any(c in FAILED_CATEGORIES for c in categories)
 
 
+def get_analysis_action(analysis: Dict[str, Any]) -> str:
+    action = str(analysis.get("action") or "").strip().lower()
+    if not action:
+        # Backward compatibility: old prompts without action are treated as ingest.
+        return "ingest"
+    return action
+
+
 def build_llm_headers(api_key: str) -> Dict[str, str]:
     return {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
 
@@ -291,6 +299,18 @@ def call_openai_compatible(
                     time.sleep(float(2 ** attempt))
                     continue
                 return llm_failure(f"{service_name} {last_reason}", category="JSON解析失败"), last_reason
+
+            action = get_analysis_action(result)
+            if action not in ("ingest", "pass"):
+                last_reason = f"invalid action: {action or 'empty'}"
+                if attempt < LLM_MAX_RETRY - 1:
+                    time.sleep(float(2 ** attempt))
+                    continue
+                return llm_failure(f"{service_name} {last_reason}", category="JSON解析失败"), last_reason
+            if action == "pass":
+                reason_val = result.get("reason")
+                result["reason"] = str(reason_val).strip() if reason_val is not None else ""
+            result["action"] = action
             return result, ""
 
         if status in NON_RETRIABLE_STATUS_CODES:
@@ -881,6 +901,7 @@ def run_llm_queue(
     if total <= 0:
         log("[LLM] queue empty")
         return
+    stats.setdefault("llm_filtered", 0)
 
     lock = threading.Lock()
     in_flight_keys: set = set()
@@ -900,6 +921,12 @@ def run_llm_queue(
                 has_in_flight_key = True
 
             analysis = analyze_with_nvidia(article, system_prompt)
+            action = get_analysis_action(analysis)
+            if action == "pass":
+                with lock:
+                    stats["llm_filtered"] += 1
+                return
+
             categories = analysis.get("categories") or []
             if isinstance(categories, list) and any(c in FAILED_CATEGORIES for c in categories):
                 with lock:
@@ -983,7 +1010,10 @@ def run_llm_queue(
                 log(f"[LLM] task failed: {exc}")
             done += 1
             bar = render_progress(done, total, width=config.PROGRESS_BAR_WIDTH)
-            msg = f"[LLM] {bar} ok={stats['llm_success']} fail={stats['llm_failed']}"
+            msg = (
+                f"[LLM] {bar} ok={stats['llm_success']} "
+                f"filtered={stats['llm_filtered']} fail={stats['llm_failed']}"
+            )
             if sys.stdout.isatty():
                 sys.stdout.write("\r" + msg)
                 sys.stdout.flush()
@@ -1094,6 +1124,7 @@ def main() -> Dict[str, Any]:
         persist_ready_source_states(source_states, tenant_token)
         stats = {
             "llm_success": 0,
+            "llm_filtered": 0,
             "llm_failed": 0,
             "feishu_create_failed": 0,
             "entries_processed": 0,
@@ -1114,6 +1145,7 @@ def main() -> Dict[str, Any]:
             f"processed={stats['entries_processed']} "
             f"new={stats['entries_new']} "
             f"llm_ok={stats['llm_success']} "
+            f"llm_filtered={stats['llm_filtered']} "
             f"llm_failed={stats['llm_failed']} "
             f"feishu_failed={stats['feishu_create_failed']}"
         )
