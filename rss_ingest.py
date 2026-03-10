@@ -23,9 +23,16 @@ from rss_parser import build_item_key, entry_published_ts, entry_text_content, f
 FAILED_CATEGORIES = {"调用失败", "调用异常", "解析失败", "JSON解析失败", "异常"}
 SECONDARY_NVIDIA_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
 FALLBACK_LLM_MODEL = "deepseek/deepseek-chat:free"
+PRIMARY_NVIDIA_MAX_TOKENS = 16384
+SECONDARY_NVIDIA_MAX_TOKENS = 4096
+DEFAULT_MAX_TOKENS = 4096
 LLM_MAX_RETRY = 3
 RETRIABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 NON_RETRIABLE_STATUS_CODES = {400, 401, 403}
+NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
+
+_nvidia_key_lock = threading.Lock()
+_nvidia_key_inflight: Dict[str, int] = {}
 
 def log(msg: str) -> None:
     try:
@@ -72,6 +79,12 @@ def render_progress(done: int, total: int, width: int = 20) -> str:
         return "0/0 [" + "".ljust(width, ".") + "]"
     filled = int(width * done / total)
     return f"{done}/{total} [" + "#" * filled + "." * (width - filled) + "]"
+
+
+def format_ratio(numerator: int, denominator: int) -> str:
+    if denominator <= 0:
+        return "0.0%"
+    return f"{(numerator / denominator) * 100:.1f}%"
 
 
 
@@ -203,6 +216,20 @@ def llm_failure(summary: str = "", category: str = "调用异常") -> Dict[str, 
     }
 
 
+def attach_llm_meta(analysis: Dict[str, Any], **meta: Any) -> Dict[str, Any]:
+    result = dict(analysis or {})
+    current_meta = result.get("_llm_meta")
+    merged_meta: Dict[str, Any] = dict(current_meta) if isinstance(current_meta, dict) else {}
+    merged_meta.update(meta)
+    result["_llm_meta"] = merged_meta
+    return result
+
+
+def get_llm_meta(analysis: Dict[str, Any]) -> Dict[str, Any]:
+    meta = analysis.get("_llm_meta")
+    return meta if isinstance(meta, dict) else {}
+
+
 def is_failed_analysis(analysis: Dict[str, Any]) -> bool:
     categories = analysis.get("categories") or []
     if not isinstance(categories, list):
@@ -220,6 +247,62 @@ def get_analysis_action(analysis: Dict[str, Any]) -> str:
 
 def build_llm_headers(api_key: str) -> Dict[str, str]:
     return {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+
+
+def get_nvidia_api_keys() -> List[str]:
+    keys: List[str] = []
+    primary_key = str(config.NVIDIA_API_KEY or "").strip()
+    if primary_key:
+        keys.append(primary_key)
+
+    for raw_key in getattr(config, "NVIDIA_API_KEYS", []):
+        key = str(raw_key or "").strip()
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def acquire_nvidia_api_key() -> tuple[str, int, int]:
+    keys = get_nvidia_api_keys()
+    if not keys:
+        return "", 0, 0
+
+    with _nvidia_key_lock:
+        for key in list(_nvidia_key_inflight.keys()):
+            if key not in keys:
+                _nvidia_key_inflight.pop(key, None)
+
+        indexed_keys = list(enumerate(keys, start=1))
+        for _, key in indexed_keys:
+            _nvidia_key_inflight.setdefault(key, 0)
+
+        slot, selected_key = min(
+            indexed_keys,
+            key=lambda item: (_nvidia_key_inflight.get(item[1], 0), item[0]),
+        )
+        _nvidia_key_inflight[selected_key] = _nvidia_key_inflight.get(selected_key, 0) + 1
+        return selected_key, slot, len(keys)
+
+
+def release_nvidia_api_key(api_key: str) -> None:
+    if not api_key:
+        return
+
+    with _nvidia_key_lock:
+        inflight = _nvidia_key_inflight.get(api_key, 0)
+        if inflight <= 1:
+            _nvidia_key_inflight.pop(api_key, None)
+            return
+        _nvidia_key_inflight[api_key] = inflight - 1
+
+
+def get_max_tokens_for_model(service_name: str, model_name: str) -> int:
+    model = str(model_name or "").strip()
+    if service_name == "NVIDIA" and model == SECONDARY_NVIDIA_MODEL:
+        return SECONDARY_NVIDIA_MAX_TOKENS
+    if service_name == "NVIDIA" and model == str(config.NVIDIA_MODEL or "").strip():
+        return PRIMARY_NVIDIA_MAX_TOKENS
+    return DEFAULT_MAX_TOKENS
 
 
 def normalize_openai_base_url(base_url: str) -> str:
@@ -250,7 +333,7 @@ def call_openai_compatible(
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.6,
         "top_p": 0.7,
-        "max_tokens": 4096,
+        "max_tokens": get_max_tokens_for_model(service_name, model_name),
         "stream": False,
     }
     last_reason = ""
@@ -330,6 +413,17 @@ def call_openai_compatible(
     return llm_failure(f"{service_name} {last_reason}"), (last_reason or "unknown error")
 
 
+def call_nvidia_compatible(model_name: str, prompt: str) -> tuple[Dict[str, Any], str]:
+    api_key, _slot, _key_count = acquire_nvidia_api_key()
+    if not api_key:
+        return llm_failure("NVIDIA missing API key", category="调用失败"), "missing api key"
+
+    try:
+        return call_openai_compatible("NVIDIA", NVIDIA_BASE_URL, api_key, model_name, prompt)
+    finally:
+        release_nvidia_api_key(api_key)
+
+
 def build_prompt(article: Dict[str, Any], system_prompt: str) -> str:
     china_tz = dt.timezone(dt.timedelta(hours=8))
     now = dt.datetime.now(china_tz)
@@ -373,14 +467,35 @@ def analyze_with_nvidia(article: Dict[str, Any], system_prompt: str) -> Dict[str
         if model and model not in nvidia_models:
             nvidia_models.append(model)
 
+    primary_model = nvidia_models[0] if nvidia_models else ""
+    qwen_attempted = False
+    qwen_success = False
+    primary_reason = ""
     nvidia_errors: List[str] = []
-    nvidia_base = "https://integrate.api.nvidia.com/v1"
-    for model_name in nvidia_models:
-        result, reason = call_openai_compatible("NVIDIA", nvidia_base, config.NVIDIA_API_KEY, model_name, prompt)
+    for index, model_name in enumerate(nvidia_models):
+        is_qwen_fallback = index > 0 and model_name == SECONDARY_NVIDIA_MODEL
+        if is_qwen_fallback:
+            qwen_attempted = True
+            title = truncate_text(str(article.get("title") or ""), 80)
+            source = truncate_text(str(article.get("source") or ""), 40)
+            reason_text = primary_reason or "unknown"
+            log(f"[LLM] switch_to_qwen reason={reason_text} source={source} title={title}")
+        result, reason = call_nvidia_compatible(model_name, prompt)
         if not is_failed_analysis(result):
-            return result
+            if is_qwen_fallback:
+                qwen_success = True
+            return attach_llm_meta(
+                result,
+                primary_model=primary_model,
+                final_model=model_name,
+                switched_to_qwen=qwen_attempted,
+                qwen_success=qwen_success,
+                fallback_used=False,
+            )
         if reason:
             nvidia_errors.append(f"{model_name}: {reason}")
+            if index == 0:
+                primary_reason = reason
             if reason.startswith("HTTP 401") or reason.startswith("HTTP 403"):
                 break
 
@@ -394,7 +509,14 @@ def analyze_with_nvidia(article: Dict[str, Any], system_prompt: str) -> Dict[str
             prompt,
         )
         if not is_failed_analysis(fallback_result):
-            return fallback_result
+            return attach_llm_meta(
+                fallback_result,
+                primary_model=primary_model,
+                final_model=FALLBACK_LLM_MODEL,
+                switched_to_qwen=qwen_attempted,
+                qwen_success=qwen_success,
+                fallback_used=True,
+            )
         if fallback_reason:
             fallback_errors.append(fallback_reason)
     else:
@@ -405,7 +527,14 @@ def analyze_with_nvidia(article: Dict[str, Any], system_prompt: str) -> Dict[str
         f"Fallback失败[{'; '.join(fallback_errors)}]"
     )
     log(f"[LLM] {summary}")
-    return llm_failure(summary=summary)
+    return attach_llm_meta(
+        llm_failure(summary=summary),
+        primary_model=primary_model,
+        final_model="",
+        switched_to_qwen=qwen_attempted,
+        qwen_success=qwen_success,
+        fallback_used=bool(config.FALLBACK_LLM_API_KEY),
+    )
 
 
 def normalize_points(points: Any) -> List[str]:
@@ -902,6 +1031,9 @@ def run_llm_queue(
         log("[LLM] queue empty")
         return
     stats.setdefault("llm_filtered", 0)
+    stats.setdefault("llm_requests_total", 0)
+    stats.setdefault("llm_switched_to_qwen", 0)
+    stats.setdefault("llm_qwen_success", 0)
 
     lock = threading.Lock()
     in_flight_keys: set = set()
@@ -919,8 +1051,15 @@ def run_llm_queue(
                     return
                 in_flight_keys.add(item_key)
                 has_in_flight_key = True
+                stats["llm_requests_total"] += 1
 
             analysis = analyze_with_nvidia(article, system_prompt)
+            llm_meta = get_llm_meta(analysis)
+            with lock:
+                if llm_meta.get("switched_to_qwen"):
+                    stats["llm_switched_to_qwen"] += 1
+                    if llm_meta.get("qwen_success"):
+                        stats["llm_qwen_success"] += 1
             action = get_analysis_action(analysis)
             if action == "pass":
                 with lock:
@@ -1012,7 +1151,8 @@ def run_llm_queue(
             bar = render_progress(done, total, width=config.PROGRESS_BAR_WIDTH)
             msg = (
                 f"[LLM] {bar} ok={stats['llm_success']} "
-                f"filtered={stats['llm_filtered']} fail={stats['llm_failed']}"
+                f"filtered={stats['llm_filtered']} fail={stats['llm_failed']} "
+                f"qwen_switch={stats['llm_switched_to_qwen']}"
             )
             if sys.stdout.isatty():
                 sys.stdout.write("\r" + msg)
@@ -1066,9 +1206,9 @@ def validate_runtime_config() -> List[str]:
         "FEISHU_PROMPT_DOC_LINK",
         "请在函数配置的环境变量中填写完整的飞书文档链接 FEISHU_PROMPT_DOC_LINK。",
     )
-    if not config.NVIDIA_API_KEY and not config.FALLBACK_LLM_API_KEY:
+    if not get_nvidia_api_keys() and not config.FALLBACK_LLM_API_KEY:
         errors.append(
-            "至少需要配置 NVIDIA_API_KEY 或 FALLBACK_LLM_API_KEY 其中之一。"
+            "至少需要配置 NVIDIA_API_KEY / NVIDIA_API_KEYS / FALLBACK_LLM_API_KEY 其中之一。"
         )
     return errors
 
@@ -1089,7 +1229,8 @@ def main() -> Dict[str, Any]:
         log(
             "[Config] startup validation passed. "
             f"business_config_source={config.PRIMARY_CONFIG_SOURCE_SUMMARY} "
-            f"llm_concurrency={config.LLM_CONCURRENCY}"
+            f"llm_concurrency={config.LLM_CONCURRENCY} "
+            f"nvidia_keys={len(get_nvidia_api_keys())}"
         )
         log("[Config] Actual run frequency comes from the FC timer trigger.")
         tenant_token = get_tenant_access_token(config.FEISHU_APP_ID, config.FEISHU_APP_SECRET, config.HTTP_TIMEOUT, config.HTTP_RETRIES)
@@ -1126,6 +1267,9 @@ def main() -> Dict[str, Any]:
             "llm_success": 0,
             "llm_filtered": 0,
             "llm_failed": 0,
+            "llm_requests_total": 0,
+            "llm_switched_to_qwen": 0,
+            "llm_qwen_success": 0,
             "feishu_create_failed": 0,
             "entries_processed": 0,
             "entries_new": 0,
@@ -1147,6 +1291,8 @@ def main() -> Dict[str, Any]:
             f"llm_ok={stats['llm_success']} "
             f"llm_filtered={stats['llm_filtered']} "
             f"llm_failed={stats['llm_failed']} "
+            f"qwen_switch={stats['llm_switched_to_qwen']}/{stats['llm_requests_total']}({format_ratio(stats['llm_switched_to_qwen'], stats['llm_requests_total'])}) "
+            f"qwen_recovered={stats['llm_qwen_success']} "
             f"feishu_failed={stats['feishu_create_failed']}"
         )
         return {

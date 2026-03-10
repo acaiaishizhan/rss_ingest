@@ -1,6 +1,8 @@
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -116,6 +118,34 @@ def test_analyze_with_nvidia_fallback_to_openai_compatible(monkeypatch):
     assert any(service == "Fallback" for service, _ in calls)
 
 
+def test_analyze_with_nvidia_marks_qwen_success(monkeypatch):
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEY", "n-key")
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEYS", [])
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_MODEL", "model-primary")
+    monkeypatch.setattr(rss_ingest.config, "FALLBACK_LLM_API_KEY", "")
+
+    calls = []
+
+    def fake_call(service_name, base_url, api_key, model_name, prompt):
+        calls.append((service_name, model_name))
+        if model_name == "model-primary":
+            return rss_ingest.llm_failure("NVIDIA HTTP 500"), "HTTP 500"
+        return {"categories": ["news"], "score": 1.0, "one_liner": "", "points": []}, ""
+
+    monkeypatch.setattr(rss_ingest, "call_openai_compatible", fake_call)
+
+    result = rss_ingest.analyze_with_nvidia({"title": "t", "content": "c", "source": "feed"}, "prompt")
+
+    assert result["categories"] == ["news"]
+    assert result["_llm_meta"]["switched_to_qwen"] is True
+    assert result["_llm_meta"]["qwen_success"] is True
+    assert result["_llm_meta"]["final_model"] == rss_ingest.SECONDARY_NVIDIA_MODEL
+    assert calls == [
+        ("NVIDIA", "model-primary"),
+        ("NVIDIA", rss_ingest.SECONDARY_NVIDIA_MODEL),
+    ]
+
+
 def test_call_openai_compatible_retries_on_empty_json(monkeypatch):
     monkeypatch.setattr(rss_ingest, "LLM_MAX_RETRY", 3)
     monkeypatch.setattr(rss_ingest.time, "sleep", lambda *_args, **_kwargs: None)
@@ -193,6 +223,81 @@ def test_call_openai_compatible_retries_on_invalid_action(monkeypatch):
     assert call_count["n"] == 2
 
 
+def test_call_openai_compatible_uses_model_specific_max_tokens(monkeypatch):
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_MODEL", "model-primary")
+
+    class FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "{\"categories\":[\"news\"],\"score\":1,\"one_liner\":\"\",\"points\":[]}"
+                        }
+                    }
+                ]
+            }
+
+    payloads = []
+
+    def fake_post(_url, headers=None, json=None, timeout=None):
+        payloads.append(json)
+        return FakeResp()
+
+    monkeypatch.setattr(rss_ingest.requests, "post", fake_post)
+
+    rss_ingest.call_openai_compatible("NVIDIA", "https://example.com/v1", "k", "model-primary", "prompt")
+    rss_ingest.call_openai_compatible(
+        "NVIDIA",
+        "https://example.com/v1",
+        "k",
+        rss_ingest.SECONDARY_NVIDIA_MODEL,
+        "prompt",
+    )
+
+    assert payloads[0]["max_tokens"] == rss_ingest.PRIMARY_NVIDIA_MAX_TOKENS
+    assert payloads[1]["max_tokens"] == rss_ingest.SECONDARY_NVIDIA_MAX_TOKENS
+
+
+def test_get_nvidia_api_keys_merges_primary_and_extra(monkeypatch):
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEY", "k1")
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEYS", ["k2", "k1", "k3"])
+
+    assert rss_ingest.get_nvidia_api_keys() == ["k1", "k2", "k3"]
+
+
+def test_call_nvidia_compatible_uses_multiple_keys_in_parallel(monkeypatch):
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEY", "k1")
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEYS", ["k2"])
+
+    barrier = threading.Barrier(2)
+    used_keys = []
+    used_keys_lock = threading.Lock()
+
+    def fake_call(service_name, base_url, api_key, model_name, prompt):
+        barrier.wait(timeout=1)
+        with used_keys_lock:
+            used_keys.append(api_key)
+        time.sleep(0.05)
+        return {"categories": ["news"], "score": 1.0, "one_liner": "", "points": []}, ""
+
+    monkeypatch.setattr(rss_ingest, "call_openai_compatible", fake_call)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(rss_ingest.call_nvidia_compatible, "model-primary", "prompt-1"),
+            executor.submit(rss_ingest.call_nvidia_compatible, "model-primary", "prompt-2"),
+        ]
+        for future in futures:
+            result, reason = future.result()
+            assert reason == ""
+            assert result["categories"] == ["news"]
+
+    assert used_keys == ["k1", "k2"] or used_keys == ["k2", "k1"]
+
+
 def test_run_llm_queue_skips_duplicate_writes(monkeypatch):
     create_calls = []
     update_calls = []
@@ -264,6 +369,60 @@ def test_run_llm_queue_skips_duplicate_writes(monkeypatch):
     assert source_states["r1"]["new_count"] == 1
     assert source_states["r1"]["persisted"] is True
     assert "dup" in existing_keys
+
+
+def test_run_llm_queue_counts_qwen_switch(monkeypatch):
+    monkeypatch.setattr(rss_ingest.config, "LLM_CONCURRENCY", 1)
+    monkeypatch.setattr(
+        rss_ingest,
+        "analyze_with_nvidia",
+        lambda article, prompt: {
+            "categories": ["news"],
+            "score": 1.0,
+            "one_liner": "",
+            "points": [],
+            "_llm_meta": {"switched_to_qwen": True, "qwen_success": True},
+        },
+    )
+    monkeypatch.setattr(rss_ingest, "create_bitable_record_with_id", lambda *args, **kwargs: (True, "news-record"))
+    monkeypatch.setattr(rss_ingest, "update_bitable_record_fields", lambda *args, **kwargs: True)
+
+    source_states = {
+        "r1": {
+            "source": {"record_id": "r1", "name": "feed-1", "feed_url": "https://example.com/rss"},
+            "now_ms": 123,
+            "latest_pub_ms": 456,
+            "latest_key": "k1",
+            "updated_failed_items": [],
+            "new_count": 0,
+            "pending_count": 1,
+            "persisted": False,
+        }
+    }
+    queue = [
+        {
+            "source_id": "r1",
+            "item_key": "k1",
+            "article": {"title": "t", "content": "x", "link": "", "published": 0, "source": "feed-1"},
+            "entry_ts": 0,
+            "entry_ts_ms": 0,
+            "from_failed": False,
+        }
+    ]
+    stats = {
+        "llm_success": 0,
+        "llm_failed": 0,
+        "feishu_create_failed": 0,
+        "entries_processed": 0,
+        "entries_new": 0,
+    }
+
+    run_llm_queue(queue, source_states, "tenant", set(), "prompt", stats)
+
+    assert stats["llm_requests_total"] == 1
+    assert stats["llm_switched_to_qwen"] == 1
+    assert stats["llm_qwen_success"] == 1
+    assert stats["llm_success"] == 1
 
 
 def test_run_llm_queue_filters_pass_action(monkeypatch):

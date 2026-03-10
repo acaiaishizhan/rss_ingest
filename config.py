@@ -53,6 +53,19 @@ def read_env_int(name: str, default: int, minimum: int | None = None) -> int:
     return parsed
 
 
+def read_env_str_list(name: str) -> list[str]:
+    value = os.getenv(name)
+    if value is None:
+        return []
+    parts = re.split(r"[\r\n,]+", value)
+    items: list[str] = []
+    for part in parts:
+        item = part.strip()
+        if item and item not in items:
+            items.append(item)
+    return items
+
+
 def extract_bitable_app_token(url: str) -> str:
     match = re.search(r"/base/([A-Za-z0-9_-]+)", url)
     return match.group(1) if match else ""
@@ -76,6 +89,7 @@ FEISHU_NEWS_TABLE_LINK = read_env_str("FEISHU_NEWS_TABLE_LINK")
 FEISHU_RSS_TABLE_LINK = read_env_str("FEISHU_RSS_TABLE_LINK")
 FEISHU_PROMPT_DOC_LINK = read_env_str("FEISHU_PROMPT_DOC_LINK")
 NVIDIA_API_KEY = read_env_str("NVIDIA_API_KEY")
+NVIDIA_API_KEYS = read_env_str_list("NVIDIA_API_KEYS")
 NVIDIA_MODEL = read_env_str("NVIDIA_MODEL", "moonshotai/kimi-k2-thinking")
 FALLBACK_LLM_API_KEY = read_env_str("FALLBACK_LLM_API_KEY")
 FALLBACK_LLM_BASE_URL = read_env_str("FALLBACK_LLM_BASE_URL", "https://openrouter.ai/api/v1")
@@ -128,12 +142,12 @@ FETCH_STATUS_PARSE_ERROR = "parse_error"
 FETCH_STATUS_OPTIONS = {FETCH_STATUS_SUCCESS, FETCH_STATUS_TIMEOUT, FETCH_STATUS_HTTP_ERROR, FETCH_STATUS_PARSE_ERROR}
 ITEM_ID_STRATEGY_OPTIONS = {"guid", "link", "title_pubdate", "content_hash"}
 CONTENT_LANGUAGE_OPTIONS = {"zh", "en", "jp", "mixed", "other"}
-HTTP_TIMEOUT = read_env_int("HTTP_TIMEOUT", 20, minimum=1)
+HTTP_TIMEOUT = read_env_int("HTTP_TIMEOUT", 60, minimum=1)
 HTTP_RETRIES = read_env_int("HTTP_RETRIES", 3, minimum=1)
 NVIDIA_RETRIES = read_env_int("NVIDIA_RETRIES", 10, minimum=1)
 FAILED_ITEMS_MAX = read_env_int("FAILED_ITEMS_MAX", 50, minimum=1)
 FAILED_ITEMS_RETRY_LIMIT = read_env_int("FAILED_ITEMS_RETRY_LIMIT", 5, minimum=1)
 FAILED_ITEMS_MAX_AGE_DAYS = read_env_int("FAILED_ITEMS_MAX_AGE_DAYS", 7, minimum=1)
 FAILED_ITEMS_MAX_MISS = read_env_int("FAILED_ITEMS_MAX_MISS", 3, minimum=1)
-LLM_CONCURRENCY = read_env_int("LLM_CONCURRENCY", 20, minimum=1)
+LLM_CONCURRENCY = read_env_int("LLM_CONCURRENCY", 3, minimum=1)
 PROGRESS_BAR_WIDTH = read_env_int("PROGRESS_BAR_WIDTH", 20, minimum=1)
