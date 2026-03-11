@@ -21,9 +21,8 @@ from feishu_client import (
 from rss_parser import build_item_key, entry_published_ts, entry_text_content, fetch_feed, normalize_entry
 
 FAILED_CATEGORIES = {"调用失败", "调用异常", "解析失败", "JSON解析失败", "异常"}
-SECONDARY_NVIDIA_MODEL = "qwen/qwen3-next-80b-a3b-instruct"
-FALLBACK_LLM_MODEL = "deepseek/deepseek-chat:free"
-PRIMARY_NVIDIA_MAX_TOKENS = 16384
+SECONDARY_NVIDIA_MODEL = "moonshotai/kimi-k2-instruct-0905"
+PRIMARY_NVIDIA_MAX_TOKENS = 4096
 SECONDARY_NVIDIA_MAX_TOKENS = 4096
 DEFAULT_MAX_TOKENS = 4096
 LLM_MAX_RETRY = 3
@@ -262,6 +261,13 @@ def get_nvidia_api_keys() -> List[str]:
     return keys
 
 
+def get_effective_llm_workers() -> int:
+    nvidia_key_count = len(get_nvidia_api_keys())
+    if nvidia_key_count > 0:
+        return max(1, config.LLM_CONCURRENCY * nvidia_key_count)
+    return max(1, config.LLM_CONCURRENCY)
+
+
 def acquire_nvidia_api_key() -> tuple[str, int, int]:
     keys = get_nvidia_api_keys()
     if not keys:
@@ -298,11 +304,24 @@ def release_nvidia_api_key(api_key: str) -> None:
 
 def get_max_tokens_for_model(service_name: str, model_name: str) -> int:
     model = str(model_name or "").strip()
-    if service_name == "NVIDIA" and model == SECONDARY_NVIDIA_MODEL:
+    if service_name == "NVIDIA" and is_secondary_nvidia_model(model):
         return SECONDARY_NVIDIA_MAX_TOKENS
     if service_name == "NVIDIA" and model == str(config.NVIDIA_MODEL or "").strip():
         return PRIMARY_NVIDIA_MAX_TOKENS
     return DEFAULT_MAX_TOKENS
+
+
+def is_secondary_nvidia_model(model_name: str) -> bool:
+    return str(model_name or "").strip() == SECONDARY_NVIDIA_MODEL
+
+
+def get_nvidia_models(queue_total: int = 0) -> List[str]:
+    nvidia_models: List[str] = []
+    for name in [config.NVIDIA_MODEL, SECONDARY_NVIDIA_MODEL]:
+        model = str(name or "").strip()
+        if model and model not in nvidia_models:
+            nvidia_models.append(model)
+    return nvidia_models
 
 
 def normalize_openai_base_url(base_url: str) -> str:
@@ -312,6 +331,24 @@ def normalize_openai_base_url(base_url: str) -> str:
     if url.endswith("/chat/completions"):
         return url
     return f"{url}/chat/completions"
+
+
+def get_custom_api_missing_fields() -> List[str]:
+    missing_fields: List[str] = []
+    if not str(config.CUSTOM_API_KEY or "").strip():
+        missing_fields.append("CUSTOM_API_KEY")
+    if not str(config.CUSTOM_API_BASE or "").strip():
+        missing_fields.append("CUSTOM_API_BASE")
+    if not str(config.CUSTOM_API_MODEL or "").strip():
+        missing_fields.append("CUSTOM_API_MODEL")
+    return missing_fields
+
+
+def has_any_custom_api_config() -> bool:
+    return any(
+        str(value or "").strip()
+        for value in (config.CUSTOM_API_KEY, config.CUSTOM_API_BASE, config.CUSTOM_API_MODEL)
+    )
 
 
 def call_openai_compatible(
@@ -459,37 +496,33 @@ def parse_llm_json(raw_text: str, service: str) -> Optional[Dict[str, Any]]:
         log(f"[{service}] parse error: {exc}")
         return None
  
-def analyze_with_nvidia(article: Dict[str, Any], system_prompt: str) -> Dict[str, Any]:
+def analyze_with_nvidia(article: Dict[str, Any], system_prompt: str, queue_total: int = 0) -> Dict[str, Any]:
     prompt = build_prompt(article, system_prompt)
-    nvidia_models: List[str] = []
-    for name in [config.NVIDIA_MODEL, SECONDARY_NVIDIA_MODEL]:
-        model = str(name or "").strip()
-        if model and model not in nvidia_models:
-            nvidia_models.append(model)
+    nvidia_models = get_nvidia_models(queue_total)
 
     primary_model = nvidia_models[0] if nvidia_models else ""
-    qwen_attempted = False
-    qwen_success = False
+    secondary_attempted = False
+    secondary_success = False
     primary_reason = ""
     nvidia_errors: List[str] = []
     for index, model_name in enumerate(nvidia_models):
-        is_qwen_fallback = index > 0 and model_name == SECONDARY_NVIDIA_MODEL
-        if is_qwen_fallback:
-            qwen_attempted = True
+        is_secondary_fallback = index > 0 and is_secondary_nvidia_model(model_name)
+        if is_secondary_fallback:
+            secondary_attempted = True
             title = truncate_text(str(article.get("title") or ""), 80)
             source = truncate_text(str(article.get("source") or ""), 40)
             reason_text = primary_reason or "unknown"
-            log(f"[LLM] switch_to_qwen reason={reason_text} source={source} title={title}")
+            log(f"[LLM] switch_to_secondary reason={reason_text} source={source} title={title}")
         result, reason = call_nvidia_compatible(model_name, prompt)
         if not is_failed_analysis(result):
-            if is_qwen_fallback:
-                qwen_success = True
+            if is_secondary_fallback:
+                secondary_success = True
             return attach_llm_meta(
                 result,
                 primary_model=primary_model,
                 final_model=model_name,
-                switched_to_qwen=qwen_attempted,
-                qwen_success=qwen_success,
+                switched_to_secondary=secondary_attempted,
+                secondary_success=secondary_success,
                 fallback_used=False,
             )
         if reason:
@@ -500,27 +533,28 @@ def analyze_with_nvidia(article: Dict[str, Any], system_prompt: str) -> Dict[str
                 break
 
     fallback_errors: List[str] = []
-    if config.FALLBACK_LLM_API_KEY:
+    custom_api_missing = get_custom_api_missing_fields()
+    if not custom_api_missing:
         fallback_result, fallback_reason = call_openai_compatible(
-            "Fallback",
-            config.FALLBACK_LLM_BASE_URL,
-            config.FALLBACK_LLM_API_KEY,
-            FALLBACK_LLM_MODEL,
+            "Custom",
+            config.CUSTOM_API_BASE,
+            config.CUSTOM_API_KEY,
+            config.CUSTOM_API_MODEL,
             prompt,
         )
         if not is_failed_analysis(fallback_result):
             return attach_llm_meta(
                 fallback_result,
                 primary_model=primary_model,
-                final_model=FALLBACK_LLM_MODEL,
-                switched_to_qwen=qwen_attempted,
-                qwen_success=qwen_success,
+                final_model=config.CUSTOM_API_MODEL,
+                switched_to_secondary=secondary_attempted,
+                secondary_success=secondary_success,
                 fallback_used=True,
             )
         if fallback_reason:
             fallback_errors.append(fallback_reason)
     else:
-        fallback_errors.append("missing FALLBACK_LLM_API_KEY")
+        fallback_errors.append(f"missing {', '.join(custom_api_missing)}")
 
     summary = (
         f"NVIDIA失败[{'; '.join(nvidia_errors) if nvidia_errors else 'unknown'}]; "
@@ -531,9 +565,9 @@ def analyze_with_nvidia(article: Dict[str, Any], system_prompt: str) -> Dict[str
         llm_failure(summary=summary),
         primary_model=primary_model,
         final_model="",
-        switched_to_qwen=qwen_attempted,
-        qwen_success=qwen_success,
-        fallback_used=bool(config.FALLBACK_LLM_API_KEY),
+        switched_to_secondary=secondary_attempted,
+        secondary_success=secondary_success,
+        fallback_used=not bool(custom_api_missing),
     )
 
 
@@ -1030,10 +1064,11 @@ def run_llm_queue(
     if total <= 0:
         log("[LLM] queue empty")
         return
+    max_workers = min(total, get_effective_llm_workers())
     stats.setdefault("llm_filtered", 0)
     stats.setdefault("llm_requests_total", 0)
-    stats.setdefault("llm_switched_to_qwen", 0)
-    stats.setdefault("llm_qwen_success", 0)
+    stats.setdefault("llm_switched_to_secondary", 0)
+    stats.setdefault("llm_secondary_success", 0)
 
     lock = threading.Lock()
     in_flight_keys: set = set()
@@ -1053,13 +1088,19 @@ def run_llm_queue(
                 has_in_flight_key = True
                 stats["llm_requests_total"] += 1
 
-            analysis = analyze_with_nvidia(article, system_prompt)
+            analysis = analyze_with_nvidia(article, system_prompt, queue_total=total)
             llm_meta = get_llm_meta(analysis)
             with lock:
-                if llm_meta.get("switched_to_qwen"):
-                    stats["llm_switched_to_qwen"] += 1
-                    if llm_meta.get("qwen_success"):
-                        stats["llm_qwen_success"] += 1
+                switched_to_secondary = bool(
+                    llm_meta.get("switched_to_secondary") or llm_meta.get("switched_to_qwen")
+                )
+                secondary_success = bool(
+                    llm_meta.get("secondary_success") or llm_meta.get("qwen_success")
+                )
+                if switched_to_secondary:
+                    stats["llm_switched_to_secondary"] += 1
+                    if secondary_success:
+                        stats["llm_secondary_success"] += 1
             action = get_analysis_action(analysis)
             if action == "pass":
                 with lock:
@@ -1138,7 +1179,7 @@ def run_llm_queue(
                     state_to_persist["persisted"] = False
 
     done = 0
-    with ThreadPoolExecutor(max_workers=config.LLM_CONCURRENCY) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(handle_item, item) for item in queue]
         for future in as_completed(futures):
             try:
@@ -1152,7 +1193,7 @@ def run_llm_queue(
             msg = (
                 f"[LLM] {bar} ok={stats['llm_success']} "
                 f"filtered={stats['llm_filtered']} fail={stats['llm_failed']} "
-                f"qwen_switch={stats['llm_switched_to_qwen']}"
+                f"secondary_switch={stats['llm_switched_to_secondary']}"
             )
             if sys.stdout.isatty():
                 sys.stdout.write("\r" + msg)
@@ -1206,9 +1247,16 @@ def validate_runtime_config() -> List[str]:
         "FEISHU_PROMPT_DOC_LINK",
         "请在函数配置的环境变量中填写完整的飞书文档链接 FEISHU_PROMPT_DOC_LINK。",
     )
-    if not get_nvidia_api_keys() and not config.FALLBACK_LLM_API_KEY:
+    custom_api_missing = get_custom_api_missing_fields()
+    if has_any_custom_api_config() and custom_api_missing:
         errors.append(
-            "至少需要配置 NVIDIA_API_KEY / NVIDIA_API_KEYS / FALLBACK_LLM_API_KEY 其中之一。"
+            "CUSTOM_API 配置不完整，缺少："
+            + " / ".join(custom_api_missing)
+            + "。"
+        )
+    if not get_nvidia_api_keys() and custom_api_missing:
+        errors.append(
+            "至少需要配置 NVIDIA_API_KEY / NVIDIA_API_KEYS，或完整配置 CUSTOM_API_KEY / CUSTOM_API_BASE / CUSTOM_API_MODEL。"
         )
     return errors
 
@@ -1229,8 +1277,9 @@ def main() -> Dict[str, Any]:
         log(
             "[Config] startup validation passed. "
             f"business_config_source={config.PRIMARY_CONFIG_SOURCE_SUMMARY} "
-            f"llm_concurrency={config.LLM_CONCURRENCY} "
-            f"nvidia_keys={len(get_nvidia_api_keys())}"
+            f"llm_concurrency_per_key={config.LLM_CONCURRENCY} "
+            f"nvidia_keys={len(get_nvidia_api_keys())} "
+            f"llm_workers={get_effective_llm_workers()}"
         )
         log("[Config] Actual run frequency comes from the FC timer trigger.")
         tenant_token = get_tenant_access_token(config.FEISHU_APP_ID, config.FEISHU_APP_SECRET, config.HTTP_TIMEOUT, config.HTTP_RETRIES)
@@ -1268,8 +1317,8 @@ def main() -> Dict[str, Any]:
             "llm_filtered": 0,
             "llm_failed": 0,
             "llm_requests_total": 0,
-            "llm_switched_to_qwen": 0,
-            "llm_qwen_success": 0,
+            "llm_switched_to_secondary": 0,
+            "llm_secondary_success": 0,
             "feishu_create_failed": 0,
             "entries_processed": 0,
             "entries_new": 0,
@@ -1291,8 +1340,8 @@ def main() -> Dict[str, Any]:
             f"llm_ok={stats['llm_success']} "
             f"llm_filtered={stats['llm_filtered']} "
             f"llm_failed={stats['llm_failed']} "
-            f"qwen_switch={stats['llm_switched_to_qwen']}/{stats['llm_requests_total']}({format_ratio(stats['llm_switched_to_qwen'], stats['llm_requests_total'])}) "
-            f"qwen_recovered={stats['llm_qwen_success']} "
+            f"secondary_switch={stats['llm_switched_to_secondary']}/{stats['llm_requests_total']}({format_ratio(stats['llm_switched_to_secondary'], stats['llm_requests_total'])}) "
+            f"secondary_recovered={stats['llm_secondary_success']} "
             f"feishu_failed={stats['feishu_create_failed']}"
         )
         return {
