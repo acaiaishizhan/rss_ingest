@@ -3,6 +3,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -93,12 +94,159 @@ def test_split_sources_and_queue_skips_malformed_entry(monkeypatch):
     assert stats["queue_total"] == 1
 
 
+def test_parse_prompt_sections_splits_screen_and_summary():
+    raw_prompt = """
+提示词
+PROMPT_SCREEN
+
+screen body
+
+PROMPT_SUMMARIZE
+
+summary body
+"""
+
+    sections = rss_ingest.parse_prompt_sections(raw_prompt)
+
+    assert sections["screen_prompt"] == "screen body"
+    assert sections["summarize_prompt"] == "summary body"
+    assert sections["keyword_blocklist"] == []
+
+
+def test_parse_prompt_sections_extracts_keyword_blocklist():
+    raw_prompt = """
+KEYWORD_BLOCKLIST
+以太坊
+Web3
+
+PROMPT_SCREEN
+
+screen body
+
+PROMPT_SUMMARIZE
+
+summary body
+"""
+
+    sections = rss_ingest.parse_prompt_sections(raw_prompt)
+
+    assert sections["keyword_blocklist"] == ["以太坊", "Web3"]
+
+
+def test_analyze_article_merges_screen_and_summary(monkeypatch):
+    calls = []
+
+    def fake_analyze(article, prompt):
+        calls.append(prompt)
+        if prompt == "screen prompt":
+            return {
+                "action": "ingest",
+                "categories": ["AI前沿资讯"],
+                "score": 8.2,
+                "reason": "值得进入精选池",
+                "_llm_meta": {"action_present": True},
+            }
+        return {
+            "title_zh": "中文标题",
+            "one_liner": "一篇关于测试流程的文章",
+            "points": ["要点1", "要点2"],
+        }
+
+    monkeypatch.setattr(rss_ingest, "analyze_with_nvidia", fake_analyze)
+
+    result = rss_ingest.analyze_article(
+        {"title": "t", "content": "c", "source": "feed"},
+        {"screen_prompt": "screen prompt", "summarize_prompt": "summary prompt"},
+    )
+
+    assert result["action"] == "ingest"
+    assert result["categories"] == ["AI前沿资讯"]
+    assert result["score"] == 8.2
+    assert result["title_zh"] == "中文标题"
+    assert result["one_liner"] == "一篇关于测试流程的文章"
+    assert result["points"] == ["要点1", "要点2"]
+    assert calls == ["screen prompt", "summary prompt"]
+
+
+def test_analyze_article_pass_skips_summary(monkeypatch):
+    calls = []
+
+    def fake_analyze(article, prompt):
+        calls.append(prompt)
+        return {
+            "action": "pass",
+            "reason": "命中过滤规则",
+            "_llm_meta": {"action_present": True},
+        }
+
+    monkeypatch.setattr(rss_ingest, "analyze_with_nvidia", fake_analyze)
+
+    result = rss_ingest.analyze_article(
+        {"title": "t", "content": "c", "source": "feed"},
+        {"screen_prompt": "screen prompt", "summarize_prompt": "summary prompt"},
+    )
+
+    assert result["action"] == "pass"
+    assert result["reason"] == "命中过滤规则"
+    assert calls == ["screen prompt"]
+
+
+def test_analyze_article_keyword_filter_skips_llm(monkeypatch):
+    seen_calls = []
+
+    def fake_analyze(article, prompt):
+        seen_calls.append(prompt)
+        return {"action": "ingest", "categories": ["news"], "score": 8.0, "reason": "x"}
+
+    monkeypatch.setattr(rss_ingest, "analyze_with_nvidia", fake_analyze)
+
+    result = rss_ingest.analyze_article(
+        {"title": "以太坊价格波动", "content": "普通新闻", "source": "feed"},
+        {
+            "keyword_blocklist": ["以太坊"],
+            "screen_prompt": "screen prompt",
+            "summarize_prompt": "summary prompt",
+        },
+    )
+
+    assert result["action"] == "pass"
+    assert "以太坊" in result["reason"]
+    assert rss_ingest.get_llm_meta(result)["keyword_filtered"] is True
+    assert rss_ingest.get_llm_meta(result)["llm_request_count"] == 0
+    assert seen_calls == []
+
+
+def test_analyze_article_summary_failure_returns_failed_analysis(monkeypatch):
+    def fake_analyze(article, prompt):
+        if prompt == "screen prompt":
+            return {
+                "action": "ingest",
+                "categories": ["AI前沿资讯"],
+                "score": 8.2,
+                "reason": "值得进入精选池",
+                "_llm_meta": {"action_present": True},
+            }
+        return rss_ingest.llm_failure("summary invalid", category="解析失败")
+
+    monkeypatch.setattr(rss_ingest, "analyze_with_nvidia", fake_analyze)
+
+    result = rss_ingest.analyze_article(
+        {"title": "t", "content": "c", "source": "feed"},
+        {"screen_prompt": "screen prompt", "summarize_prompt": "summary prompt"},
+    )
+
+    assert rss_ingest.is_failed_analysis(result)
+    assert rss_ingest.get_llm_meta(result)["failure_stage"] == "summary"
+    assert "summary:" in rss_ingest.get_llm_meta(result)["failure_reason"]
+
+
 def test_analyze_with_nvidia_fallback_to_custom_api(monkeypatch):
     monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEY", "n-key")
     monkeypatch.setattr(rss_ingest.config, "NVIDIA_MODEL", "model-primary")
     monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_KEY", "c-key")
     monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_BASE", "https://custom.example.com/v1")
     monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_MODEL", "custom-model")
+    monkeypatch.setattr(rss_ingest.config, "USE_CUSTOM_API", False)
 
     calls = []
 
@@ -121,8 +269,41 @@ def test_analyze_with_nvidia_fallback_to_custom_api(monkeypatch):
 
 
 def test_secondary_nvidia_constants_are_updated():
-    assert rss_ingest.SECONDARY_NVIDIA_MODEL == "moonshotai/kimi-k2-instruct-0905"
+    assert rss_ingest.config.NVIDIA_SECONDARY_MODEL == "moonshotai/kimi-k2-instruct-0905"
     assert rss_ingest.PRIMARY_NVIDIA_MAX_TOKENS == 4096
+
+
+def test_analyze_with_nvidia_prefers_custom_api_when_switch_enabled(monkeypatch):
+    monkeypatch.setattr(rss_ingest.config, "USE_CUSTOM_API", True)
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEY", "n-key")
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEYS", [])
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_MODEL", "model-primary")
+    monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_KEY", "c-key")
+    monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_BASE", "https://custom.example.com/v1")
+    monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_MODEL", "custom-model")
+
+    calls = []
+
+    def fake_call(service_name, base_url, api_key, model_name, prompt):
+        calls.append((service_name, model_name))
+        return {"categories": ["news"], "score": 1.0, "one_liner": "", "points": []}, ""
+
+    monkeypatch.setattr(rss_ingest, "call_openai_compatible", fake_call)
+
+    result = rss_ingest.analyze_with_nvidia({"title": "t", "content": "c", "source": "feed"}, "prompt")
+
+    assert result["categories"] == ["news"]
+    assert result["_llm_meta"]["primary_service"] == "Custom"
+    assert result["_llm_meta"]["final_service"] == "Custom"
+    assert result["_llm_meta"]["final_model"] == "custom-model"
+    assert calls == [("Custom", "custom-model")]
+
+
+def test_rss_ingest_source_no_longer_references_qwen_meta_keys():
+    source = Path(rss_ingest.__file__).read_text(encoding="utf-8")
+
+    assert "switched_to_qwen" not in source
+    assert "qwen_success" not in source
 
 
 def test_analyze_with_nvidia_marks_secondary_success(monkeypatch):
@@ -132,6 +313,7 @@ def test_analyze_with_nvidia_marks_secondary_success(monkeypatch):
     monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_KEY", "")
     monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_BASE", "")
     monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_MODEL", "")
+    monkeypatch.setattr(rss_ingest.config, "USE_CUSTOM_API", False)
 
     calls = []
 
@@ -148,33 +330,30 @@ def test_analyze_with_nvidia_marks_secondary_success(monkeypatch):
     assert result["categories"] == ["news"]
     assert result["_llm_meta"]["switched_to_secondary"] is True
     assert result["_llm_meta"]["secondary_success"] is True
-    assert result["_llm_meta"]["final_model"] == rss_ingest.SECONDARY_NVIDIA_MODEL
+    assert result["_llm_meta"]["final_model"] == rss_ingest.config.NVIDIA_SECONDARY_MODEL
     assert calls == [
         ("NVIDIA", "model-primary"),
-        ("NVIDIA", rss_ingest.SECONDARY_NVIDIA_MODEL),
+        ("NVIDIA", rss_ingest.config.NVIDIA_SECONDARY_MODEL),
     ]
 
 
-def test_get_nvidia_models_keeps_both_models_on_large_queue(monkeypatch):
+def test_get_nvidia_models_returns_primary_then_secondary(monkeypatch):
     monkeypatch.setattr(rss_ingest.config, "NVIDIA_MODEL", "model-primary")
 
-    assert rss_ingest.get_nvidia_models(queue_total=10) == [
+    assert rss_ingest.get_nvidia_models() == [
         "model-primary",
-        rss_ingest.SECONDARY_NVIDIA_MODEL,
-    ]
-    assert rss_ingest.get_nvidia_models(queue_total=101) == [
-        "model-primary",
-        rss_ingest.SECONDARY_NVIDIA_MODEL,
+        rss_ingest.config.NVIDIA_SECONDARY_MODEL,
     ]
 
 
-def test_analyze_with_nvidia_keeps_primary_first_for_large_queue(monkeypatch):
+def test_analyze_with_nvidia_keeps_primary_first(monkeypatch):
     monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEY", "n-key")
     monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEYS", [])
     monkeypatch.setattr(rss_ingest.config, "NVIDIA_MODEL", "model-primary")
     monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_KEY", "")
     monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_BASE", "")
     monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_MODEL", "")
+    monkeypatch.setattr(rss_ingest.config, "USE_CUSTOM_API", False)
 
     calls = []
 
@@ -184,11 +363,7 @@ def test_analyze_with_nvidia_keeps_primary_first_for_large_queue(monkeypatch):
 
     monkeypatch.setattr(rss_ingest, "call_openai_compatible", fake_call)
 
-    result = rss_ingest.analyze_with_nvidia(
-        {"title": "t", "content": "c", "source": "feed"},
-        "prompt",
-        queue_total=101,
-    )
+    result = rss_ingest.analyze_with_nvidia({"title": "t", "content": "c", "source": "feed"}, "prompt")
 
     assert result["categories"] == ["news"]
     assert result["_llm_meta"]["primary_model"] == "model-primary"
@@ -210,6 +385,7 @@ def test_validate_runtime_config_accepts_complete_custom_api(monkeypatch):
     monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_KEY", "c-key")
     monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_BASE", "https://custom.example.com/v1")
     monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_MODEL", "custom-model")
+    monkeypatch.setattr(rss_ingest.config, "USE_CUSTOM_API", False)
 
     assert rss_ingest.validate_runtime_config() == []
 
@@ -227,11 +403,32 @@ def test_validate_runtime_config_rejects_incomplete_custom_api(monkeypatch):
     monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_KEY", "c-key")
     monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_BASE", "")
     monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_MODEL", "")
+    monkeypatch.setattr(rss_ingest.config, "USE_CUSTOM_API", False)
 
     errors = rss_ingest.validate_runtime_config()
 
     assert "CUSTOM_API 配置不完整" in errors[0]
     assert any("至少需要配置 NVIDIA_API_KEY / NVIDIA_API_KEYS" in error for error in errors)
+
+
+def test_validate_runtime_config_requires_custom_api_when_switch_enabled(monkeypatch):
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_APP_ID", "app-id")
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_APP_SECRET", "app-secret")
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_NEWS_APP_TOKEN", "news-token")
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_NEWS_TABLE_ID", "news-table")
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_RSS_APP_TOKEN", "rss-token")
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_RSS_TABLE_ID", "rss-table")
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_PROMPT_DOC_TOKEN", "doc-token")
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEY", "n-key")
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEYS", [])
+    monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_KEY", "")
+    monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_BASE", "")
+    monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_MODEL", "")
+    monkeypatch.setattr(rss_ingest.config, "USE_CUSTOM_API", True)
+
+    errors = rss_ingest.validate_runtime_config()
+
+    assert any("USE_CUSTOM_API=true" in error for error in errors)
 
 
 def test_call_openai_compatible_retries_on_empty_json(monkeypatch):
@@ -341,7 +538,7 @@ def test_call_openai_compatible_uses_model_specific_max_tokens(monkeypatch):
         "NVIDIA",
         "https://example.com/v1",
         "k",
-        rss_ingest.SECONDARY_NVIDIA_MODEL,
+        rss_ingest.config.NVIDIA_SECONDARY_MODEL,
         "prompt",
     )
 
@@ -410,7 +607,7 @@ def test_run_llm_queue_skips_duplicate_writes(monkeypatch):
     monkeypatch.setattr(
         rss_ingest,
         "analyze_with_nvidia",
-        lambda article, prompt, queue_total=0: {"categories": ["news"], "score": 1.0, "one_liner": "", "points": []},
+        lambda article, prompt: {"categories": ["news"], "score": 1.0, "one_liner": "", "points": []},
     )
 
     def fake_create(*args, **kwargs):
@@ -480,7 +677,7 @@ def test_run_llm_queue_counts_secondary_switch(monkeypatch):
     monkeypatch.setattr(
         rss_ingest,
         "analyze_with_nvidia",
-        lambda article, prompt, queue_total=0: {
+        lambda article, prompt: {
             "categories": ["news"],
             "score": 1.0,
             "one_liner": "",
@@ -529,15 +726,15 @@ def test_run_llm_queue_counts_secondary_switch(monkeypatch):
     assert stats["llm_success"] == 1
 
 
-def test_run_llm_queue_passes_total_to_analyze(monkeypatch):
+def test_run_llm_queue_calls_analyze_with_article_and_prompt(monkeypatch):
     monkeypatch.setattr(rss_ingest.config, "LLM_CONCURRENCY", 1)
     monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEY", "k1")
     monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEYS", [])
 
-    seen_totals = []
+    seen_calls = []
 
-    def fake_analyze(article, prompt, queue_total=0):
-        seen_totals.append(queue_total)
+    def fake_analyze(article, prompt):
+        seen_calls.append((article["title"], prompt))
         return {"categories": ["news"], "score": 1.0, "one_liner": "", "points": []}
 
     monkeypatch.setattr(rss_ingest, "analyze_with_nvidia", fake_analyze)
@@ -584,7 +781,7 @@ def test_run_llm_queue_passes_total_to_analyze(monkeypatch):
 
     run_llm_queue(queue, source_states, "tenant", set(), "prompt", stats)
 
-    assert seen_totals == [2, 2]
+    assert seen_calls == [("t1", "prompt"), ("t2", "prompt")]
 
 
 def test_run_llm_queue_uses_effective_worker_count(monkeypatch):
@@ -616,7 +813,7 @@ def test_run_llm_queue_uses_effective_worker_count(monkeypatch):
     monkeypatch.setattr(
         rss_ingest,
         "analyze_with_nvidia",
-        lambda article, prompt, queue_total=0: {"categories": ["news"], "score": 1.0, "one_liner": "", "points": []},
+        lambda article, prompt: {"categories": ["news"], "score": 1.0, "one_liner": "", "points": []},
     )
     monkeypatch.setattr(rss_ingest, "create_bitable_record_with_id", lambda *args, **kwargs: (True, "news-record"))
     monkeypatch.setattr(rss_ingest, "update_bitable_record_fields", lambda *args, **kwargs: True)
@@ -672,7 +869,7 @@ def test_run_llm_queue_filters_pass_action(monkeypatch):
     monkeypatch.setattr(
         rss_ingest,
         "analyze_with_nvidia",
-        lambda article, prompt, queue_total=0: {"action": "pass", "reason": "命中过滤规则"},
+        lambda article, prompt: {"action": "pass", "reason": "命中过滤规则"},
     )
 
     def fake_create(*args, **kwargs):
@@ -728,6 +925,55 @@ def test_run_llm_queue_filters_pass_action(monkeypatch):
     assert source_states["r1"]["persisted"] is True
 
 
+def test_run_llm_queue_records_stage_failure_reason(monkeypatch):
+    monkeypatch.setattr(rss_ingest.config, "LLM_CONCURRENCY", 1)
+
+    def fake_analyze_article(article, prompt_config):
+        return rss_ingest.attach_llm_meta(
+            rss_ingest.llm_failure("summary: missing title_zh", category="解析失败"),
+            failure_reason="summary: missing title_zh",
+            failure_stage="summary",
+        )
+
+    monkeypatch.setattr(rss_ingest, "analyze_article", fake_analyze_article)
+    monkeypatch.setattr(rss_ingest, "update_bitable_record_fields", lambda *args, **kwargs: True)
+
+    source_states = {
+        "r1": {
+            "source": {"record_id": "r1", "name": "feed-1", "feed_url": "https://example.com/rss"},
+            "now_ms": 123,
+            "latest_pub_ms": 456,
+            "latest_key": "k1",
+            "updated_failed_items": [],
+            "new_count": 0,
+            "pending_count": 1,
+            "persisted": False,
+        }
+    }
+    queue = [
+        {
+            "source_id": "r1",
+            "item_key": "k1",
+            "article": {"title": "t", "content": "x", "link": "", "published": 0, "source": "feed-1"},
+            "entry_ts": 0,
+            "entry_ts_ms": 0,
+            "from_failed": False,
+        }
+    ]
+    stats = {
+        "llm_success": 0,
+        "llm_failed": 0,
+        "feishu_create_failed": 0,
+        "entries_processed": 0,
+        "entries_new": 0,
+    }
+
+    run_llm_queue(queue, source_states, "tenant", set(), {"screen_prompt": "s1", "summarize_prompt": "s2"}, stats)
+
+    assert stats["llm_failed"] == 1
+    assert source_states["r1"]["updated_failed_items"][0]["last_error"] == "summary: missing title_zh"
+
+
 def test_run_llm_queue_persists_finished_source_before_slow_source(monkeypatch):
     events = []
 
@@ -735,7 +981,7 @@ def test_run_llm_queue_persists_finished_source_before_slow_source(monkeypatch):
     monkeypatch.setattr(
         rss_ingest,
         "analyze_with_nvidia",
-        lambda article, prompt, queue_total=0: {"categories": ["news"], "score": 1.0, "one_liner": "", "points": []},
+        lambda article, prompt: {"categories": ["news"], "score": 1.0, "one_liner": "", "points": []},
     )
 
     def fake_create(*args, **kwargs):

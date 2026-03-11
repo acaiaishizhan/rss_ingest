@@ -53,6 +53,20 @@ def read_env_int(name: str, default: int, minimum: int | None = None) -> int:
     return parsed
 
 
+def read_env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if not normalized:
+        return default
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def read_env_str_list(name: str) -> list[str]:
     value = os.getenv(name)
     if value is None:
@@ -91,9 +105,11 @@ FEISHU_PROMPT_DOC_LINK = read_env_str("FEISHU_PROMPT_DOC_LINK")
 NVIDIA_API_KEY = read_env_str("NVIDIA_API_KEY")
 NVIDIA_API_KEYS = read_env_str_list("NVIDIA_API_KEYS")
 NVIDIA_MODEL = read_env_str("NVIDIA_MODEL", "qwen/qwen3-next-80b-a3b-instruct")
+NVIDIA_SECONDARY_MODEL = read_env_str("NVIDIA_SECONDARY_MODEL", "moonshotai/kimi-k2-instruct-0905")
 CUSTOM_API_KEY = read_env_str("CUSTOM_API_KEY")
 CUSTOM_API_BASE = read_env_str("CUSTOM_API_BASE")
 CUSTOM_API_MODEL = read_env_str("CUSTOM_API_MODEL")
+USE_CUSTOM_API = read_env_bool("USE_CUSTOM_API", False)
 
 FEISHU_NEWS_APP_TOKEN = extract_bitable_app_token(FEISHU_NEWS_TABLE_LINK)
 FEISHU_NEWS_TABLE_ID = extract_bitable_table_id(FEISHU_NEWS_TABLE_LINK)

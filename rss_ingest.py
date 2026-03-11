@@ -21,7 +21,9 @@ from feishu_client import (
 from rss_parser import build_item_key, entry_published_ts, entry_text_content, fetch_feed, normalize_entry
 
 FAILED_CATEGORIES = {"调用失败", "调用异常", "解析失败", "JSON解析失败", "异常"}
-SECONDARY_NVIDIA_MODEL = "moonshotai/kimi-k2-instruct-0905"
+KEYWORD_BLOCKLIST_MARKER = "KEYWORD_BLOCKLIST"
+PROMPT_SCREEN_MARKER = "PROMPT_SCREEN"
+PROMPT_SUMMARIZE_MARKER = "PROMPT_SUMMARIZE"
 PRIMARY_NVIDIA_MAX_TOKENS = 4096
 SECONDARY_NVIDIA_MAX_TOKENS = 4096
 DEFAULT_MAX_TOKENS = 4096
@@ -312,12 +314,16 @@ def get_max_tokens_for_model(service_name: str, model_name: str) -> int:
 
 
 def is_secondary_nvidia_model(model_name: str) -> bool:
-    return str(model_name or "").strip() == SECONDARY_NVIDIA_MODEL
+    return str(model_name or "").strip() == get_secondary_nvidia_model()
 
 
-def get_nvidia_models(queue_total: int = 0) -> List[str]:
+def get_secondary_nvidia_model() -> str:
+    return str(config.NVIDIA_SECONDARY_MODEL or "").strip()
+
+
+def get_nvidia_models() -> List[str]:
     nvidia_models: List[str] = []
-    for name in [config.NVIDIA_MODEL, SECONDARY_NVIDIA_MODEL]:
+    for name in [config.NVIDIA_MODEL, get_secondary_nvidia_model()]:
         model = str(name or "").strip()
         if model and model not in nvidia_models:
             nvidia_models.append(model)
@@ -348,6 +354,20 @@ def has_any_custom_api_config() -> bool:
     return any(
         str(value or "").strip()
         for value in (config.CUSTOM_API_KEY, config.CUSTOM_API_BASE, config.CUSTOM_API_MODEL)
+    )
+
+
+def should_use_custom_api() -> bool:
+    return bool(getattr(config, "USE_CUSTOM_API", False))
+
+
+def call_custom_api(prompt: str) -> tuple[Dict[str, Any], str]:
+    return call_openai_compatible(
+        "Custom",
+        config.CUSTOM_API_BASE,
+        config.CUSTOM_API_KEY,
+        config.CUSTOM_API_MODEL,
+        prompt,
     )
 
 
@@ -420,6 +440,7 @@ def call_openai_compatible(
                     continue
                 return llm_failure(f"{service_name} {last_reason}", category="JSON解析失败"), last_reason
 
+            action_present = "action" in result
             action = get_analysis_action(result)
             if action not in ("ingest", "pass"):
                 last_reason = f"invalid action: {action or 'empty'}"
@@ -431,7 +452,7 @@ def call_openai_compatible(
                 reason_val = result.get("reason")
                 result["reason"] = str(reason_val).strip() if reason_val is not None else ""
             result["action"] = action
-            return result, ""
+            return attach_llm_meta(result, action_present=action_present), ""
 
         if status in NON_RETRIABLE_STATUS_CODES:
             reason = f"HTTP {status}"
@@ -459,6 +480,40 @@ def call_nvidia_compatible(model_name: str, prompt: str) -> tuple[Dict[str, Any]
         return call_openai_compatible("NVIDIA", NVIDIA_BASE_URL, api_key, model_name, prompt)
     finally:
         release_nvidia_api_key(api_key)
+
+
+def parse_prompt_sections(raw_content: str) -> Dict[str, str]:
+    text = str(raw_content or "").replace("\r\n", "\n")
+    screen_match = re.search(rf"(?m)^\s*{PROMPT_SCREEN_MARKER}\s*$", text)
+    summarize_match = re.search(rf"(?m)^\s*{PROMPT_SUMMARIZE_MARKER}\s*$", text)
+    if not screen_match or not summarize_match:
+        raise ValueError(
+            f"prompt document must contain marker lines: {PROMPT_SCREEN_MARKER} and {PROMPT_SUMMARIZE_MARKER}"
+        )
+    if summarize_match.start() <= screen_match.end():
+        raise ValueError(f"{PROMPT_SUMMARIZE_MARKER} must appear after {PROMPT_SCREEN_MARKER}")
+
+    screen_prompt = text[screen_match.end():summarize_match.start()].strip()
+    summarize_prompt = text[summarize_match.end():].strip()
+    if not screen_prompt:
+        raise ValueError(f"{PROMPT_SCREEN_MARKER} section is empty")
+    if not summarize_prompt:
+        raise ValueError(f"{PROMPT_SUMMARIZE_MARKER} section is empty")
+    blocklist_keywords: List[str] = []
+    blocklist_match = re.search(rf"(?m)^\s*{KEYWORD_BLOCKLIST_MARKER}\s*$", text)
+    if blocklist_match and blocklist_match.start() < screen_match.start():
+        raw_block = text[blocklist_match.end():screen_match.start()]
+        for raw_line in raw_block.splitlines():
+            keyword = raw_line.strip()
+            if not keyword or keyword.startswith("#"):
+                continue
+            if keyword not in blocklist_keywords:
+                blocklist_keywords.append(keyword)
+    return {
+        "screen_prompt": screen_prompt,
+        "summarize_prompt": summarize_prompt,
+        "keyword_blocklist": blocklist_keywords,
+    }
 
 
 def build_prompt(article: Dict[str, Any], system_prompt: str) -> str:
@@ -496,11 +551,46 @@ def parse_llm_json(raw_text: str, service: str) -> Optional[Dict[str, Any]]:
         log(f"[{service}] parse error: {exc}")
         return None
  
-def analyze_with_nvidia(article: Dict[str, Any], system_prompt: str, queue_total: int = 0) -> Dict[str, Any]:
+def analyze_with_nvidia(article: Dict[str, Any], system_prompt: str) -> Dict[str, Any]:
     prompt = build_prompt(article, system_prompt)
-    nvidia_models = get_nvidia_models(queue_total)
+    custom_api_missing = get_custom_api_missing_fields()
+    use_custom_api = should_use_custom_api()
+    primary_service = "Custom" if use_custom_api else "NVIDIA"
+    primary_model = str(config.CUSTOM_API_MODEL or "").strip() if use_custom_api else ""
 
-    primary_model = nvidia_models[0] if nvidia_models else ""
+    custom_errors: List[str] = []
+    if use_custom_api:
+        if custom_api_missing:
+            summary = "USE_CUSTOM_API=true 但 CUSTOM_API 配置不完整，缺少：" + ", ".join(custom_api_missing)
+            log(f"[LLM] {summary}")
+            return attach_llm_meta(
+                llm_failure(summary=summary, category="调用失败"),
+                primary_model=primary_model,
+                final_model="",
+                switched_to_secondary=False,
+                secondary_success=False,
+                fallback_used=False,
+                primary_service=primary_service,
+                final_service="",
+            )
+
+        custom_result, custom_reason = call_custom_api(prompt)
+        if not is_failed_analysis(custom_result):
+            return attach_llm_meta(
+                custom_result,
+                primary_model=primary_model,
+                final_model=config.CUSTOM_API_MODEL,
+                switched_to_secondary=False,
+                secondary_success=False,
+                fallback_used=False,
+                primary_service=primary_service,
+                final_service="Custom",
+            )
+        custom_errors.append(custom_reason or "unknown")
+
+    nvidia_models = get_nvidia_models()
+    if not primary_model:
+        primary_model = nvidia_models[0] if nvidia_models else ""
     secondary_attempted = False
     secondary_success = False
     primary_reason = ""
@@ -523,7 +613,9 @@ def analyze_with_nvidia(article: Dict[str, Any], system_prompt: str, queue_total
                 final_model=model_name,
                 switched_to_secondary=secondary_attempted,
                 secondary_success=secondary_success,
-                fallback_used=False,
+                fallback_used=use_custom_api,
+                primary_service=primary_service,
+                final_service="NVIDIA",
             )
         if reason:
             nvidia_errors.append(f"{model_name}: {reason}")
@@ -532,16 +624,9 @@ def analyze_with_nvidia(article: Dict[str, Any], system_prompt: str, queue_total
             if reason.startswith("HTTP 401") or reason.startswith("HTTP 403"):
                 break
 
-    fallback_errors: List[str] = []
-    custom_api_missing = get_custom_api_missing_fields()
-    if not custom_api_missing:
-        fallback_result, fallback_reason = call_openai_compatible(
-            "Custom",
-            config.CUSTOM_API_BASE,
-            config.CUSTOM_API_KEY,
-            config.CUSTOM_API_MODEL,
-            prompt,
-        )
+    fallback_errors: List[str] = list(custom_errors)
+    if not use_custom_api and not custom_api_missing:
+        fallback_result, fallback_reason = call_custom_api(prompt)
         if not is_failed_analysis(fallback_result):
             return attach_llm_meta(
                 fallback_result,
@@ -550,15 +635,17 @@ def analyze_with_nvidia(article: Dict[str, Any], system_prompt: str, queue_total
                 switched_to_secondary=secondary_attempted,
                 secondary_success=secondary_success,
                 fallback_used=True,
+                primary_service=primary_service,
+                final_service="Custom",
             )
         if fallback_reason:
             fallback_errors.append(fallback_reason)
-    else:
+    elif not use_custom_api:
         fallback_errors.append(f"missing {', '.join(custom_api_missing)}")
 
     summary = (
         f"NVIDIA失败[{'; '.join(nvidia_errors) if nvidia_errors else 'unknown'}]; "
-        f"Fallback失败[{'; '.join(fallback_errors)}]"
+        f"Fallback失败[{'; '.join(fallback_errors) if fallback_errors else 'unknown'}]"
     )
     log(f"[LLM] {summary}")
     return attach_llm_meta(
@@ -567,7 +654,9 @@ def analyze_with_nvidia(article: Dict[str, Any], system_prompt: str, queue_total
         final_model="",
         switched_to_secondary=secondary_attempted,
         secondary_success=secondary_success,
-        fallback_used=not bool(custom_api_missing),
+        fallback_used=bool(fallback_errors),
+        primary_service=primary_service,
+        final_service="",
     )
 
 
@@ -595,6 +684,214 @@ def build_summary(one_liner: str, points: List[str]) -> str:
     if points:
         return "\n".join(f"- {p}" for p in points)
     return ""
+
+
+def normalize_string_list(value: Any) -> List[str]:
+    items = value if isinstance(value, list) else [value]
+    normalized: List[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
+def parse_score(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def find_blocked_keyword(article: Dict[str, Any], keywords: List[str]) -> str:
+    if not keywords:
+        return ""
+    title = str(article.get("title") or "")
+    content = clean_html_to_text(str(article.get("content") or ""))
+    haystack = f"{title}\n{content}".lower()
+    for keyword in keywords:
+        normalized = str(keyword or "").strip()
+        if normalized and normalized.lower() in haystack:
+            return normalized
+    return ""
+
+
+def get_failed_category(analysis: Dict[str, Any], default: str = "解析失败") -> str:
+    categories = normalize_string_list(analysis.get("categories") or [])
+    for category in categories:
+        if category in FAILED_CATEGORIES:
+            return category
+    return default
+
+
+def extract_failure_reason(analysis: Dict[str, Any], default: str = "llm_failed") -> str:
+    meta = get_llm_meta(analysis)
+    reason = str(meta.get("failure_reason") or "").strip()
+    if reason:
+        return truncate_text(reason, 200)
+
+    for key in ("summary", "reason"):
+        text = str(analysis.get(key) or "").strip()
+        if text:
+            return truncate_text(text, 200)
+    return default
+
+
+def build_stage_failure(stage: str, reason: str, category: str, **meta: Any) -> Dict[str, Any]:
+    failure_reason = f"{stage}: {reason}"
+    return attach_llm_meta(
+        llm_failure(summary=failure_reason, category=category),
+        failure_stage=stage,
+        failure_reason=failure_reason,
+        **meta,
+    )
+
+
+def aggregate_llm_meta(screen_meta: Dict[str, Any], summary_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    summary_meta = summary_meta or {}
+    return {
+        "screen_llm_meta": screen_meta,
+        "summary_llm_meta": summary_meta,
+        "switched_to_secondary": bool(screen_meta.get("switched_to_secondary")) or bool(summary_meta.get("switched_to_secondary")),
+        "secondary_success": bool(screen_meta.get("secondary_success")) or bool(summary_meta.get("secondary_success")),
+        "primary_service": screen_meta.get("primary_service") or "",
+        "primary_model": screen_meta.get("primary_model") or "",
+        "final_service": summary_meta.get("final_service") or screen_meta.get("final_service") or "",
+        "final_model": summary_meta.get("final_model") or screen_meta.get("final_model") or "",
+    }
+
+
+def validate_screen_result(analysis: Dict[str, Any]) -> Dict[str, Any]:
+    meta = get_llm_meta(analysis)
+    if meta.get("action_present") is False:
+        raise ValueError("missing action")
+
+    action = str(analysis.get("action") or "").strip().lower()
+    if action not in ("ingest", "pass"):
+        raise ValueError(f"invalid action: {action or 'empty'}")
+
+    reason = str(analysis.get("reason") or "").strip()
+    if not reason:
+        raise ValueError("missing reason")
+
+    if action == "pass":
+        return {
+            "action": "pass",
+            "reason": reason,
+        }
+
+    categories = normalize_string_list(analysis.get("categories") or [])
+    if not categories:
+        raise ValueError("missing categories")
+
+    score = parse_score(analysis.get("score"))
+    if score is None or score < 0 or score > 10:
+        raise ValueError("invalid score")
+
+    return {
+        "action": "ingest",
+        "categories": categories[:3],
+        "score": score,
+        "reason": reason,
+    }
+
+
+def validate_summary_result(analysis: Dict[str, Any]) -> Dict[str, Any]:
+    title_zh = str(analysis.get("title_zh") or "").strip()
+    if not title_zh:
+        raise ValueError("missing title_zh")
+
+    one_liner = str(analysis.get("one_liner") or "").strip()
+    if not one_liner:
+        raise ValueError("missing one_liner")
+
+    points = normalize_points(analysis.get("points") or [])
+    if len(points) < 2:
+        raise ValueError("points must contain at least 2 items")
+
+    return {
+        "title_zh": title_zh,
+        "one_liner": one_liner,
+        "points": points[:4],
+    }
+
+
+def analyze_article(article: Dict[str, Any], prompt_config: Any) -> Dict[str, Any]:
+    if isinstance(prompt_config, str):
+        return attach_llm_meta(analyze_with_nvidia(article, prompt_config), llm_request_count=1)
+
+    if not isinstance(prompt_config, dict):
+        return build_stage_failure("prompt", "invalid prompt config", "解析失败")
+
+    screen_prompt = str(prompt_config.get("screen_prompt") or "").strip()
+    summarize_prompt = str(prompt_config.get("summarize_prompt") or "").strip()
+    if not screen_prompt or not summarize_prompt:
+        return build_stage_failure("prompt", "missing prompt sections", "解析失败")
+
+    keyword_blocklist = normalize_string_list(prompt_config.get("keyword_blocklist") or [])
+    blocked_keyword = find_blocked_keyword(article, keyword_blocklist)
+    if blocked_keyword:
+        title = truncate_text(str(article.get("title") or ""), 80)
+        source = truncate_text(str(article.get("source") or ""), 40)
+        log(f"[Filter] keyword_blocked keyword={blocked_keyword} source={source} title={title}")
+        return attach_llm_meta(
+            {
+                "action": "pass",
+                "reason": f"命中关键词过滤：{blocked_keyword}",
+            },
+            keyword_filtered=True,
+            keyword_hit=blocked_keyword,
+            llm_request_count=0,
+        )
+
+    screen_result = analyze_with_nvidia(article, screen_prompt)
+    screen_meta = get_llm_meta(screen_result)
+    if is_failed_analysis(screen_result):
+        return build_stage_failure(
+            "screen",
+            extract_failure_reason(screen_result),
+            get_failed_category(screen_result),
+            **aggregate_llm_meta(screen_meta),
+        )
+
+    try:
+        validated_screen = validate_screen_result(screen_result)
+    except ValueError as exc:
+        return build_stage_failure(
+            "screen",
+            str(exc),
+            "解析失败",
+            **aggregate_llm_meta(screen_meta),
+        )
+
+    if validated_screen["action"] == "pass":
+        return attach_llm_meta(validated_screen, llm_request_count=1, **aggregate_llm_meta(screen_meta))
+
+    summary_result = analyze_with_nvidia(article, summarize_prompt)
+    summary_meta = get_llm_meta(summary_result)
+    if is_failed_analysis(summary_result):
+        return build_stage_failure(
+            "summary",
+            extract_failure_reason(summary_result),
+            get_failed_category(summary_result),
+            **aggregate_llm_meta(screen_meta, summary_meta),
+        )
+
+    try:
+        validated_summary = validate_summary_result(summary_result)
+    except ValueError as exc:
+        return build_stage_failure(
+            "summary",
+            str(exc),
+            "解析失败",
+            **aggregate_llm_meta(screen_meta, summary_meta),
+        )
+
+    merged_analysis = dict(validated_screen)
+    merged_analysis.update(validated_summary)
+    return attach_llm_meta(merged_analysis, llm_request_count=1, **aggregate_llm_meta(screen_meta, summary_meta))
 
 
 def parse_failed_items(raw: Any) -> List[Dict[str, Any]]:
@@ -1057,7 +1354,7 @@ def run_llm_queue(
     source_states: Dict[str, Dict[str, Any]],
     tenant_token: str,
     existing_keys: set,
-    system_prompt: str,
+    prompt_config: Any,
     stats: Dict[str, int],
 ) -> None:
     total = len(queue)
@@ -1086,17 +1383,13 @@ def run_llm_queue(
                     return
                 in_flight_keys.add(item_key)
                 has_in_flight_key = True
-                stats["llm_requests_total"] += 1
 
-            analysis = analyze_with_nvidia(article, system_prompt, queue_total=total)
+            analysis = analyze_article(article, prompt_config)
             llm_meta = get_llm_meta(analysis)
             with lock:
-                switched_to_secondary = bool(
-                    llm_meta.get("switched_to_secondary") or llm_meta.get("switched_to_qwen")
-                )
-                secondary_success = bool(
-                    llm_meta.get("secondary_success") or llm_meta.get("qwen_success")
-                )
+                stats["llm_requests_total"] += int(llm_meta.get("llm_request_count") or 1)
+                switched_to_secondary = bool(llm_meta.get("switched_to_secondary"))
+                secondary_success = bool(llm_meta.get("secondary_success"))
                 if switched_to_secondary:
                     stats["llm_switched_to_secondary"] += 1
                     if secondary_success:
@@ -1109,6 +1402,7 @@ def run_llm_queue(
 
             categories = analysis.get("categories") or []
             if isinstance(categories, list) and any(c in FAILED_CATEGORIES for c in categories):
+                failure_reason = extract_failure_reason(analysis)
                 with lock:
                     stats["llm_failed"] += 1
                     upsert_failed_item(
@@ -1117,7 +1411,7 @@ def run_llm_queue(
                         item["entry_ts_ms"],
                         article.get("title") or "",
                         article.get("link") or "",
-                        "llm_failed",
+                        failure_reason,
                         state["now_ms"],
                     )
                 return
@@ -1248,13 +1542,17 @@ def validate_runtime_config() -> List[str]:
         "请在函数配置的环境变量中填写完整的飞书文档链接 FEISHU_PROMPT_DOC_LINK。",
     )
     custom_api_missing = get_custom_api_missing_fields()
+    if should_use_custom_api() and custom_api_missing:
+        errors.append(
+            "USE_CUSTOM_API=true 时必须完整配置 CUSTOM_API_KEY / CUSTOM_API_BASE / CUSTOM_API_MODEL。"
+        )
     if has_any_custom_api_config() and custom_api_missing:
         errors.append(
             "CUSTOM_API 配置不完整，缺少："
             + " / ".join(custom_api_missing)
             + "。"
         )
-    if not get_nvidia_api_keys() and custom_api_missing:
+    if not should_use_custom_api() and not get_nvidia_api_keys() and custom_api_missing:
         errors.append(
             "至少需要配置 NVIDIA_API_KEY / NVIDIA_API_KEYS，或完整配置 CUSTOM_API_KEY / CUSTOM_API_BASE / CUSTOM_API_MODEL。"
         )
@@ -1277,21 +1575,29 @@ def main() -> Dict[str, Any]:
         log(
             "[Config] startup validation passed. "
             f"business_config_source={config.PRIMARY_CONFIG_SOURCE_SUMMARY} "
+            f"llm_primary_route={'custom' if should_use_custom_api() else 'nvidia'} "
             f"llm_concurrency_per_key={config.LLM_CONCURRENCY} "
             f"nvidia_keys={len(get_nvidia_api_keys())} "
             f"llm_workers={get_effective_llm_workers()}"
         )
         log("[Config] Actual run frequency comes from the FC timer trigger.")
         tenant_token = get_tenant_access_token(config.FEISHU_APP_ID, config.FEISHU_APP_SECRET, config.HTTP_TIMEOUT, config.HTTP_RETRIES)
-        system_prompt = get_document_raw_content(
+        prompt_document = get_document_raw_content(
             config.FEISHU_PROMPT_DOC_TOKEN,
             tenant_token,
             config.HTTP_TIMEOUT,
             config.HTTP_RETRIES,
         )
-        log(f"[Prompt] fetched {len(system_prompt)} chars")
-        if not system_prompt.strip():
+        log(f"[Prompt] fetched {len(prompt_document)} chars")
+        if not prompt_document.strip():
             raise RuntimeError("prompt document is empty")
+        prompt_sections = parse_prompt_sections(prompt_document)
+        log(
+            "[Prompt] sections parsed "
+            f"keyword_blocklist={len(prompt_sections.get('keyword_blocklist') or [])} "
+            f"screen_chars={len(prompt_sections['screen_prompt'])} "
+            f"summarize_chars={len(prompt_sections['summarize_prompt'])}"
+        )
         records = list_bitable_records(
             config.FEISHU_RSS_APP_TOKEN,
             config.FEISHU_RSS_TABLE_ID,
@@ -1326,7 +1632,7 @@ def main() -> Dict[str, Any]:
         stats.update(fetch_stats)
         log(f"[Queue] total={stats['queue_total']} sources_processed={stats['sources_processed']} sources_skipped={stats['sources_skipped']}")
 
-        run_llm_queue(queue, source_states, tenant_token, existing_keys, system_prompt, stats)
+        run_llm_queue(queue, source_states, tenant_token, existing_keys, prompt_sections, stats)
         persist_ready_source_states(source_states, tenant_token)
 
         log(
