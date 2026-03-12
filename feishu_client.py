@@ -17,37 +17,47 @@ def _sleep_backoff(attempt: int) -> None:
     time.sleep(min(8.0, 0.8 * (2 ** attempt) + random.random() * 0.3))
 
 
-def http_get(url: str, headers: Dict[str, str], timeout: int, retries: int, params: Optional[Dict[str, Any]] = None) -> requests.Response:
-    last_err: Optional[Exception] = None
-    for i in range(retries):
+def _http_request(
+    method: str,
+    url: str,
+    headers: Dict[str, str],
+    timeout: int,
+    retries: int,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    json_body: Optional[Dict[str, Any]] = None,
+    trust_env: bool = False,
+) -> requests.Response:
+    attempts = max(1, int(retries or 0))
+    last_err: Optional[requests.RequestException] = None
+    for i in range(attempts):
         try:
-            return requests.get(url, headers=headers, params=params, timeout=timeout)
-        except Exception as exc:
+            with requests.Session() as sess:
+                sess.trust_env = trust_env
+                return sess.request(
+                    method=method,
+                    url=url,
+                    headers=headers,
+                    params=params,
+                    json=json_body,
+                    timeout=timeout,
+                )
+        except requests.RequestException as exc:
             last_err = exc
             _sleep_backoff(i)
-    raise RuntimeError(f"HTTP GET failed after retries: {last_err}")
+    raise RuntimeError(f"HTTP {method.upper()} failed after retries: {last_err}")
+
+
+def http_get(url: str, headers: Dict[str, str], timeout: int, retries: int, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+    return _http_request("GET", url, headers, timeout, retries, params=params)
 
 
 def http_post(url: str, headers: Dict[str, str], json_body: Dict[str, Any], timeout: int, retries: int) -> requests.Response:
-    last_err: Optional[Exception] = None
-    for i in range(retries):
-        try:
-            return requests.post(url, headers=headers, json=json_body, timeout=timeout)
-        except Exception as exc:
-            last_err = exc
-            _sleep_backoff(i)
-    raise RuntimeError(f"HTTP POST failed after retries: {last_err}")
+    return _http_request("POST", url, headers, timeout, retries, json_body=json_body)
 
 
 def http_put(url: str, headers: Dict[str, str], json_body: Dict[str, Any], timeout: int, retries: int) -> requests.Response:
-    last_err: Optional[Exception] = None
-    for i in range(retries):
-        try:
-            return requests.put(url, headers=headers, json=json_body, timeout=timeout)
-        except Exception as exc:
-            last_err = exc
-            _sleep_backoff(i)
-    raise RuntimeError(f"HTTP PUT failed after retries: {last_err}")
+    return _http_request("PUT", url, headers, timeout, retries, json_body=json_body)
 
 
 def get_tenant_access_token(app_id: str, app_secret: str, timeout: int, retries: int) -> str:

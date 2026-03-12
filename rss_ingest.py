@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -48,16 +48,6 @@ def truncate_text(text: str, limit: int = 1000) -> str:
     if len(text) <= limit:
         return text
     return text[:limit - 3] + "..."
-
-
-def collect_queue_items(items: Iterable[dict], existing_keys: set) -> list:
-    out = []
-    for item in items:
-        key = item.get("item_key")
-        if not key or key in existing_keys:
-            continue
-        out.append(item)
-    return out
 
 
 def enqueue_unique_item(
@@ -180,6 +170,15 @@ def clean_html_to_text(html: str) -> str:
     return text.strip()
 
 
+def limit_prompt_text(text: Any, limit: int, label: str) -> str:
+    raw = str(text or "")
+    max_len = max(1, int(limit or 0))
+    if len(raw) <= max_len:
+        return raw
+    omitted = len(raw) - max_len
+    return f"{raw[:max_len]}\n...[{label} truncated {omitted} chars]"
+
+
 def normalize_single_select(value: Any, allowed: set, default: str = "") -> str:
     s = clean_feishu_value(value).strip()
     return s if s in allowed else default
@@ -250,6 +249,12 @@ def build_llm_headers(api_key: str) -> Dict[str, str]:
     return {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
 
 
+def post_json_without_env(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout: int) -> requests.Response:
+    with requests.Session() as sess:
+        sess.trust_env = False
+        return sess.post(url, headers=headers, json=payload, timeout=timeout)
+
+
 def get_nvidia_api_keys() -> List[str]:
     keys: List[str] = []
     primary_key = str(config.NVIDIA_API_KEY or "").strip()
@@ -308,7 +313,12 @@ def get_max_tokens_for_model(service_name: str, model_name: str) -> int:
     model = str(model_name or "").strip()
     if service_name == "NVIDIA" and is_secondary_nvidia_model(model):
         return SECONDARY_NVIDIA_MAX_TOKENS
-    if service_name == "NVIDIA" and model == str(config.NVIDIA_MODEL or "").strip():
+    primary_nvidia_models = {
+        str(config.NVIDIA_MODEL or "").strip(),
+        get_primary_screen_nvidia_model(),
+        get_primary_summarize_nvidia_model(),
+    }
+    if service_name == "NVIDIA" and model in primary_nvidia_models:
         return PRIMARY_NVIDIA_MAX_TOKENS
     return DEFAULT_MAX_TOKENS
 
@@ -317,13 +327,23 @@ def is_secondary_nvidia_model(model_name: str) -> bool:
     return str(model_name or "").strip() == get_secondary_nvidia_model()
 
 
+def get_primary_screen_nvidia_model() -> str:
+    # Screen stage should prefer explicit screen model, then primary model, then fallback model.
+    return str(config.NVIDIA_SCREEN_MODEL or config.NVIDIA_MODEL or get_secondary_nvidia_model() or "").strip()
+
+
+def get_primary_summarize_nvidia_model() -> str:
+    return str(config.NVIDIA_SUMMARIZE_MODEL or config.NVIDIA_MODEL or "").strip()
+
+
 def get_secondary_nvidia_model() -> str:
     return str(config.NVIDIA_SECONDARY_MODEL or "").strip()
 
 
-def get_nvidia_models() -> List[str]:
+def get_nvidia_models(primary_model: str = "") -> List[str]:
     nvidia_models: List[str] = []
-    for name in [config.NVIDIA_MODEL, get_secondary_nvidia_model()]:
+    primary = str(primary_model or config.NVIDIA_MODEL or "").strip()
+    for name in [primary, get_secondary_nvidia_model()]:
         model = str(name or "").strip()
         if model and model not in nvidia_models:
             nvidia_models.append(model)
@@ -397,8 +417,8 @@ def call_openai_compatible(
 
     for attempt in range(LLM_MAX_RETRY):
         try:
-            resp = requests.post(url, headers=build_llm_headers(api_key), json=payload, timeout=300)
-        except Exception as exc:
+            resp = post_json_without_env(url, headers=build_llm_headers(api_key), payload=payload, timeout=300)
+        except requests.RequestException as exc:
             last_reason = f"exception: {truncate_text(str(exc), 120)}"
             if attempt < LLM_MAX_RETRY - 1:
                 time.sleep(float(2 ** attempt))
@@ -411,6 +431,12 @@ def call_openai_compatible(
                 data = resp.json()
             except Exception as exc:
                 last_reason = f"invalid json: {truncate_text(str(exc), 120)}"
+                if attempt < LLM_MAX_RETRY - 1:
+                    time.sleep(float(2 ** attempt))
+                    continue
+                return llm_failure(f"{service_name} {last_reason}", category="JSON解析失败"), last_reason
+            if not isinstance(data, dict):
+                last_reason = "invalid json payload type"
                 if attempt < LLM_MAX_RETRY - 1:
                     time.sleep(float(2 ** attempt))
                     continue
@@ -519,6 +545,8 @@ def parse_prompt_sections(raw_content: str) -> Dict[str, str]:
 def build_prompt(article: Dict[str, Any], system_prompt: str) -> str:
     china_tz = dt.timezone(dt.timedelta(hours=8))
     now = dt.datetime.now(china_tz)
+    prompt_title = limit_prompt_text(article.get("title"), config.PROMPT_TITLE_MAX_CHARS, "title")
+    prompt_content = limit_prompt_text(article.get("content"), config.PROMPT_CONTENT_MAX_CHARS, "content")
     return f"""{system_prompt}
 
 你所处的时间为：{now.year}年{now.month:02d}月
@@ -526,8 +554,8 @@ def build_prompt(article: Dict[str, Any], system_prompt: str) -> str:
 # Input Text
 请分析以下文章：
 \"\"\"
-title：{article.get('title','')}
-content：{article.get('content','')}
+title：{prompt_title}
+content：{prompt_content}
 \"\"\"
 """
 
@@ -550,17 +578,22 @@ def parse_llm_json(raw_text: str, service: str) -> Optional[Dict[str, Any]]:
         log(f"[{service}] parse error: empty json")
         return None
     try:
-        return json.loads(json_str)
+        data = json.loads(json_str)
     except json.JSONDecodeError as exc:
         log(f"[{service}] parse error: {exc}")
         return None
+    if not isinstance(data, dict):
+        log(f"[{service}] parse error: top-level JSON must be an object")
+        return None
+    return data
  
-def analyze_with_nvidia(article: Dict[str, Any], system_prompt: str) -> Dict[str, Any]:
+def analyze_with_nvidia(article: Dict[str, Any], system_prompt: str, primary_model_override: str = "") -> Dict[str, Any]:
     prompt = build_prompt(article, system_prompt)
     custom_api_missing = get_custom_api_missing_fields()
     use_custom_api = should_use_custom_api()
     primary_service = "Custom" if use_custom_api else "NVIDIA"
     primary_model = str(config.CUSTOM_API_MODEL or "").strip() if use_custom_api else ""
+    preferred_nvidia_model = str(primary_model_override or "").strip()
 
     custom_errors: List[str] = []
     if use_custom_api:
@@ -592,9 +625,9 @@ def analyze_with_nvidia(article: Dict[str, Any], system_prompt: str) -> Dict[str
             )
         custom_errors.append(custom_reason or "unknown")
 
-    nvidia_models = get_nvidia_models()
+    nvidia_models = get_nvidia_models(preferred_nvidia_model)
     if not primary_model:
-        primary_model = nvidia_models[0] if nvidia_models else ""
+        primary_model = preferred_nvidia_model or (nvidia_models[0] if nvidia_models else "")
     secondary_attempted = False
     secondary_success = False
     primary_reason = ""
@@ -832,15 +865,18 @@ def validate_summary_result(analysis: Dict[str, Any]) -> Dict[str, Any]:
 
 def analyze_article(article: Dict[str, Any], prompt_config: Any) -> Dict[str, Any]:
     if isinstance(prompt_config, str):
-        return attach_llm_meta(analyze_with_nvidia(article, prompt_config), llm_request_count=1)
+        return attach_llm_meta(
+            analyze_with_nvidia(article, prompt_config, get_primary_screen_nvidia_model()),
+            llm_request_count=1,
+        )
 
     if not isinstance(prompt_config, dict):
-        return build_stage_failure("prompt", "invalid prompt config", "解析失败")
+        return build_stage_failure("prompt", "invalid prompt config", "解析失败", llm_request_count=0)
 
     screen_prompt = str(prompt_config.get("screen_prompt") or "").strip()
     summarize_prompt = str(prompt_config.get("summarize_prompt") or "").strip()
     if not screen_prompt or not summarize_prompt:
-        return build_stage_failure("prompt", "missing prompt sections", "解析失败")
+        return build_stage_failure("prompt", "missing prompt sections", "解析失败", llm_request_count=0)
 
     keyword_blocklist = normalize_string_list(prompt_config.get("keyword_blocklist") or [])
     blocked_keyword = find_blocked_keyword(article, keyword_blocklist)
@@ -858,13 +894,14 @@ def analyze_article(article: Dict[str, Any], prompt_config: Any) -> Dict[str, An
             llm_request_count=0,
         )
 
-    screen_result = analyze_with_nvidia(article, screen_prompt)
+    screen_result = analyze_with_nvidia(article, screen_prompt, get_primary_screen_nvidia_model())
     screen_meta = get_llm_meta(screen_result)
     if is_failed_analysis(screen_result):
         return build_stage_failure(
             "screen",
             extract_failure_reason(screen_result),
             get_failed_category(screen_result),
+            llm_request_count=1,
             **aggregate_llm_meta(screen_meta),
         )
 
@@ -875,19 +912,21 @@ def analyze_article(article: Dict[str, Any], prompt_config: Any) -> Dict[str, An
             "screen",
             str(exc),
             "解析失败",
+            llm_request_count=1,
             **aggregate_llm_meta(screen_meta),
         )
 
     if validated_screen["action"] == "pass":
         return attach_llm_meta(validated_screen, llm_request_count=1, **aggregate_llm_meta(screen_meta))
 
-    summary_result = analyze_with_nvidia(article, summarize_prompt)
+    summary_result = analyze_with_nvidia(article, summarize_prompt, get_primary_summarize_nvidia_model())
     summary_meta = get_llm_meta(summary_result)
     if is_failed_analysis(summary_result):
         return build_stage_failure(
             "summary",
             extract_failure_reason(summary_result),
             get_failed_category(summary_result),
+            llm_request_count=2,
             **aggregate_llm_meta(screen_meta, summary_meta),
         )
 
@@ -898,12 +937,13 @@ def analyze_article(article: Dict[str, Any], prompt_config: Any) -> Dict[str, An
             "summary",
             str(exc),
             "解析失败",
+            llm_request_count=2,
             **aggregate_llm_meta(screen_meta, summary_meta),
         )
 
     merged_analysis = dict(validated_screen)
     merged_analysis.update(validated_summary)
-    return attach_llm_meta(merged_analysis, llm_request_count=1, **aggregate_llm_meta(screen_meta, summary_meta))
+    return attach_llm_meta(merged_analysis, llm_request_count=2, **aggregate_llm_meta(screen_meta, summary_meta))
 
 
 def parse_failed_items(raw: Any) -> List[Dict[str, Any]]:
@@ -916,7 +956,8 @@ def parse_failed_items(raw: Any) -> List[Dict[str, Any]]:
             return []
         try:
             data = json.loads(s)
-        except Exception:
+        except Exception as exc:
+            log(f"[RSS] failed_items parse failed: {truncate_text(str(exc), 120)}")
             return []
     if isinstance(data, dict):
         data = [data]
@@ -1043,22 +1084,37 @@ def normalize_source(record: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def should_fetch(source: Dict[str, Any], now_ms: int) -> bool:
-    _ = now_ms
-    # The only active frequency gate is the FC timer trigger configured in the console.
-    return bool(source.get("enabled"))
+    if not source.get("enabled"):
+        return False
+    last_fetch_ms = parse_int(source.get("last_fetch_time")) or 0
+    if last_fetch_ms <= 0:
+        return True
+    interval_hours = int(getattr(config, "AUTO_FETCH_INTERVAL_HOURS", 3) or 3)
+    interval_ms = interval_hours * 60 * 60 * 1000
+    elapsed_ms = max(0, now_ms - last_fetch_ms)
+    return elapsed_ms >= interval_ms
 
 
-def build_news_fields(article: Dict[str, Any], analysis: Dict[str, Any], item_key: str) -> Dict[str, Any]:
+def build_article_base_fields(article: Dict[str, Any], item_key: str) -> Dict[str, Any]:
     published = article.get("published")
     if isinstance(published, (int, float)) and published > 0:
         base_ts = published
     else:
         base_ts = time.time()
-    published_ts_ms = int(base_ts * 1000)
+    return {
+        "published_ts_ms": int(base_ts * 1000),
+        "source": article.get("source") or "未知来源",
+        "full_content": clean_html_to_text(article.get("content") or ""),
+        "title": article.get("title") or "（无标题）",
+        "link": article.get("link") or "",
+        "item_key": item_key,
+    }
 
-    raw_title = article.get("title") or "（无标题）"
+
+def build_news_fields(article: Dict[str, Any], analysis: Dict[str, Any], item_key: str) -> Dict[str, Any]:
+    base = build_article_base_fields(article, item_key)
     title_zh = (analysis.get("title_zh") or "").strip()
-    title_text = title_zh if title_zh else raw_title
+    title_text = title_zh if title_zh else base["title"]
 
     score = float(analysis.get("score", 0.0) or 0.0)
     categories = analysis.get("categories") or []
@@ -1069,29 +1125,20 @@ def build_news_fields(article: Dict[str, Any], analysis: Dict[str, Any], item_ke
     points = normalize_points(analysis.get("points") or [])
     summary = build_summary(one_liner, points)
 
-    full_content = clean_html_to_text(article.get("content") or "")
-
     return {
-        config.NEWS_FIELD_TITLE: {"text": title_text, "link": article.get("link") or ""},
+        config.NEWS_FIELD_TITLE: {"text": title_text, "link": base["link"]},
         config.NEWS_FIELD_SCORE: score,
         config.NEWS_FIELD_CATEGORIES: categories,
         config.NEWS_FIELD_SUMMARY: summary,
-        config.NEWS_FIELD_PUBLISHED_MS: published_ts_ms,
-        config.NEWS_FIELD_SOURCE: article.get("source") or "未知来源",
-        config.NEWS_FIELD_FULL_CONTENT: full_content,
-        config.NEWS_FIELD_ITEM_KEY: item_key,
+        config.NEWS_FIELD_PUBLISHED_MS: base["published_ts_ms"],
+        config.NEWS_FIELD_SOURCE: base["source"],
+        config.NEWS_FIELD_FULL_CONTENT: base["full_content"],
+        config.NEWS_FIELD_ITEM_KEY: base["item_key"],
     }
 
 
 def build_filtered_fields(article: Dict[str, Any], analysis: Dict[str, Any], item_key: str) -> Dict[str, Any]:
-    published = article.get("published")
-    if isinstance(published, (int, float)) and published > 0:
-        base_ts = published
-    else:
-        base_ts = time.time()
-    published_ts_ms = int(base_ts * 1000)
-
-    raw_title = article.get("title") or "（无标题）"
+    base = build_article_base_fields(article, item_key)
     reason = str(analysis.get("reason") or "").strip()
     llm_meta = get_llm_meta(analysis)
     filter_method = "关键词过滤" if llm_meta.get("keyword_filtered") else "初筛过滤"
@@ -1102,13 +1149,13 @@ def build_filtered_fields(article: Dict[str, Any], analysis: Dict[str, Any], ite
         filter_reason = f"{filter_reason}{suffix}" if filter_reason else suffix
 
     return {
-        config.FILTERED_FIELD_TITLE: {"text": raw_title, "link": article.get("link") or ""},
+        config.FILTERED_FIELD_TITLE: {"text": base["title"], "link": base["link"]},
         config.FILTERED_FIELD_FILTER_METHOD: filter_method,
         config.FILTERED_FIELD_FILTER_REASON: filter_reason,
-        config.FILTERED_FIELD_PUBLISHED_MS: published_ts_ms,
-        config.FILTERED_FIELD_SOURCE: article.get("source") or "未知来源",
-        config.FILTERED_FIELD_FULL_CONTENT: clean_html_to_text(article.get("content") or ""),
-        config.FILTERED_FIELD_ITEM_KEY: item_key,
+        config.FILTERED_FIELD_PUBLISHED_MS: base["published_ts_ms"],
+        config.FILTERED_FIELD_SOURCE: base["source"],
+        config.FILTERED_FIELD_FULL_CONTENT: base["full_content"],
+        config.FILTERED_FIELD_ITEM_KEY: base["item_key"],
     }
 
 
@@ -1429,13 +1476,32 @@ def run_llm_queue(
     in_flight_keys: set = set()
 
     def handle_item(item: Dict[str, Any]) -> None:
-        state = source_states[item["source_id"]]
-        article = item["article"]
-        item_key = item["item_key"]
         has_in_flight_key = False
         state_to_persist: Optional[Dict[str, Any]] = None
+        state: Optional[Dict[str, Any]] = None
+        article: Dict[str, Any] = {}
+        item_key = ""
+        entry_ts_ms = 0
 
         try:
+            source_id = str(item.get("source_id") or "").strip()
+            if not source_id:
+                raise ValueError("missing source_id")
+            state = source_states.get(source_id)
+            if state is None:
+                raise KeyError(f"unknown source_id: {source_id}")
+
+            raw_article = item.get("article")
+            if not isinstance(raw_article, dict):
+                raise ValueError("invalid article payload")
+            article = raw_article
+
+            item_key = str(item.get("item_key") or "").strip()
+            if not item_key:
+                raise ValueError("missing item_key")
+
+            entry_ts_ms = parse_int(item.get("entry_ts_ms")) or 0
+
             with lock:
                 if item_key in existing_keys or item_key in in_flight_keys:
                     return
@@ -1474,7 +1540,7 @@ def run_llm_queue(
                     upsert_failed_item(
                         state["updated_failed_items"],
                         item_key,
-                        item["entry_ts_ms"],
+                        entry_ts_ms,
                         article.get("title") or "",
                         article.get("link") or "",
                         failure_reason,
@@ -1500,7 +1566,7 @@ def run_llm_queue(
                     upsert_failed_item(
                         state["updated_failed_items"],
                         item_key,
-                        item["entry_ts_ms"],
+                        entry_ts_ms,
                         article.get("title") or "",
                         article.get("link") or "",
                         "feishu_create_failed",
@@ -1516,17 +1582,20 @@ def run_llm_queue(
         except Exception as exc:
             with lock:
                 stats["llm_failed"] += 1
-                upsert_failed_item(
-                    state["updated_failed_items"],
-                    item_key,
-                    item["entry_ts_ms"],
-                    article.get("title") or "",
-                    article.get("link") or "",
-                    truncate_text(str(exc), 200),
-                    state["now_ms"],
-                )
+                if state is not None and item_key:
+                    upsert_failed_item(
+                        state["updated_failed_items"],
+                        item_key,
+                        entry_ts_ms,
+                        article.get("title") or "",
+                        article.get("link") or "",
+                        truncate_text(str(exc), 200),
+                        state["now_ms"],
+                    )
             log(f"[LLM] item failed for {article.get('source') or 'unknown source'}: {exc}")
         finally:
+            if state is None:
+                return
             with lock:
                 if has_in_flight_key:
                     in_flight_keys.discard(item_key)
@@ -1540,8 +1609,24 @@ def run_llm_queue(
 
     done = 0
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(handle_item, item) for item in queue]
-        for future in as_completed(futures):
+        queue_iter = iter(queue)
+        futures = set()
+
+        def submit_next() -> bool:
+            try:
+                next_item = next(queue_iter)
+            except StopIteration:
+                return False
+            futures.add(executor.submit(handle_item, next_item))
+            return True
+
+        for _ in range(max_workers):
+            if not submit_next():
+                break
+
+        while futures:
+            future = next(iter(as_completed(futures)))
+            futures.discard(future)
             try:
                 future.result()
             except Exception as exc:
@@ -1560,6 +1645,7 @@ def run_llm_queue(
                 sys.stdout.flush()
             else:
                 log(msg)
+            submit_next()
         if sys.stdout.isatty():
             sys.stdout.write("\n")
             sys.stdout.flush()
@@ -1650,12 +1736,18 @@ def main() -> Dict[str, Any]:
             "[Config] startup validation passed. "
             f"business_config_source={config.PRIMARY_CONFIG_SOURCE_SUMMARY} "
             f"llm_primary_route={'custom' if should_use_custom_api() else 'nvidia'} "
+            f"screen_model={get_primary_screen_nvidia_model() or '-'} "
+            f"summarize_model={get_primary_summarize_nvidia_model() or '-'} "
+            f"secondary_model={get_secondary_nvidia_model() or '-'} "
             f"filtered_table={'on' if is_filtered_table_enabled() else 'off'} "
             f"llm_concurrency_per_key={config.LLM_CONCURRENCY} "
             f"nvidia_keys={len(get_nvidia_api_keys())} "
             f"llm_workers={get_effective_llm_workers()}"
         )
-        log("[Config] Actual run frequency comes from the FC timer trigger.")
+        log(
+            "[Config] Actual run frequency comes from the trigger cadence, "
+            f"with code-side fetch interval gate={config.AUTO_FETCH_INTERVAL_HOURS}h."
+        )
         tenant_token = get_tenant_access_token(config.FEISHU_APP_ID, config.FEISHU_APP_SECRET, config.HTTP_TIMEOUT, config.HTTP_RETRIES)
         prompt_document = get_document_raw_content(
             config.FEISHU_PROMPT_DOC_TOKEN,

@@ -1,0 +1,53 @@
+name: rss-ingest
+
+on:
+  schedule:
+    # Hourly trigger; actual fetch cadence is controlled by AUTO_FETCH_INTERVAL_HOURS in app config.
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: rss-ingest
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+      FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+      FEISHU_NEWS_TABLE_LINK: ${{ secrets.FEISHU_NEWS_TABLE_LINK }}
+      FEISHU_RSS_TABLE_LINK: ${{ secrets.FEISHU_RSS_TABLE_LINK }}
+      FEISHU_FILTERED_TABLE_LINK: ${{ secrets.FEISHU_FILTERED_TABLE_LINK }}
+      FEISHU_PROMPT_DOC_LINK: ${{ secrets.FEISHU_PROMPT_DOC_LINK }}
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      NVIDIA_API_KEYS: ${{ secrets.NVIDIA_API_KEYS }}
+      NVIDIA_MODEL: ${{ vars.NVIDIA_MODEL }}
+      NVIDIA_SCREEN_MODEL: ${{ vars.NVIDIA_SCREEN_MODEL }}
+      NVIDIA_SUMMARIZE_MODEL: ${{ vars.NVIDIA_SUMMARIZE_MODEL }}
+      NVIDIA_SECONDARY_MODEL: ${{ vars.NVIDIA_SECONDARY_MODEL }}
+      CUSTOM_API_KEY: ${{ secrets.CUSTOM_API_KEY }}
+      CUSTOM_API_BASE: ${{ vars.CUSTOM_API_BASE }}
+      CUSTOM_API_MODEL: ${{ vars.CUSTOM_API_MODEL }}
+      USE_CUSTOM_API: ${{ vars.USE_CUSTOM_API }}
+      AUTO_FETCH_INTERVAL_HOURS: ${{ vars.AUTO_FETCH_INTERVAL_HOURS || '3' }}
+      HTTP_TIMEOUT: ${{ vars.HTTP_TIMEOUT || '20' }}
+      HTTP_RETRIES: ${{ vars.HTTP_RETRIES || '3' }}
+      LLM_CONCURRENCY: ${{ vars.LLM_CONCURRENCY || '3' }}
+      PROMPT_TITLE_MAX_CHARS: ${{ vars.PROMPT_TITLE_MAX_CHARS || '300' }}
+      PROMPT_CONTENT_MAX_CHARS: ${{ vars.PROMPT_CONTENT_MAX_CHARS || '12000' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run RSS ingest
+        run: python rss_ingest.py

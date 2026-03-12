@@ -40,8 +40,40 @@ def test_nvidia_secondary_model_uses_env_override(monkeypatch):
     assert reloaded.NVIDIA_SECONDARY_MODEL == "moonshotai/custom-secondary"
 
 
+def test_nvidia_screen_model_uses_builtin_empty_default(monkeypatch):
+    monkeypatch.setenv("NVIDIA_SCREEN_MODEL", "")
+
+    reloaded = reload_config_module()
+
+    assert reloaded.NVIDIA_SCREEN_MODEL == ""
+
+
+def test_nvidia_screen_model_uses_env_override(monkeypatch):
+    monkeypatch.setenv("NVIDIA_SCREEN_MODEL", "screen-model")
+
+    reloaded = reload_config_module()
+
+    assert reloaded.NVIDIA_SCREEN_MODEL == "screen-model"
+
+
+def test_nvidia_summarize_model_uses_builtin_empty_default(monkeypatch):
+    monkeypatch.setenv("NVIDIA_SUMMARIZE_MODEL", "")
+
+    reloaded = reload_config_module()
+
+    assert reloaded.NVIDIA_SUMMARIZE_MODEL == ""
+
+
+def test_nvidia_summarize_model_uses_env_override(monkeypatch):
+    monkeypatch.setenv("NVIDIA_SUMMARIZE_MODEL", "summarize-model")
+
+    reloaded = reload_config_module()
+
+    assert reloaded.NVIDIA_SUMMARIZE_MODEL == "summarize-model"
+
+
 def test_llm_concurrency_uses_new_default(monkeypatch):
-    monkeypatch.delenv("LLM_CONCURRENCY", raising=False)
+    monkeypatch.setenv("LLM_CONCURRENCY", "")
 
     reloaded = reload_config_module()
 
@@ -62,3 +94,19 @@ def test_use_custom_api_uses_env_override(monkeypatch):
     reloaded = reload_config_module()
 
     assert reloaded.USE_CUSTOM_API is True
+
+
+def test_auto_fetch_interval_hours_uses_builtin_default(monkeypatch):
+    monkeypatch.delenv("AUTO_FETCH_INTERVAL_HOURS", raising=False)
+
+    reloaded = reload_config_module()
+
+    assert reloaded.AUTO_FETCH_INTERVAL_HOURS == 3
+
+
+def test_auto_fetch_interval_hours_uses_env_override(monkeypatch):
+    monkeypatch.setenv("AUTO_FETCH_INTERVAL_HOURS", "6")
+
+    reloaded = reload_config_module()
+
+    assert reloaded.AUTO_FETCH_INTERVAL_HOURS == 6

@@ -10,22 +10,10 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import rss_ingest
 from rss_ingest import (
-    collect_queue_items,
     persist_ready_source_states,
     run_llm_queue,
     split_sources_and_queue,
 )
-
-
-def test_collect_queue_items_skips_existing_keys():
-    items = [
-        {"item_key": "a", "content": "x"},
-        {"item_key": "b", "content": "y"},
-    ]
-    existing = {"a"}
-    out = collect_queue_items(items, existing)
-    assert [i["item_key"] for i in out] == ["b"]
-
 
 def test_split_sources_and_queue_returns_queue(monkeypatch):
     monkeypatch.setattr(rss_ingest, "update_bitable_record_fields", lambda *args, **kwargs: None)
@@ -94,6 +82,16 @@ def test_split_sources_and_queue_skips_malformed_entry(monkeypatch):
     assert stats["queue_total"] == 1
 
 
+def test_should_fetch_respects_auto_fetch_interval(monkeypatch):
+    monkeypatch.setattr(rss_ingest.config, "AUTO_FETCH_INTERVAL_HOURS", 3)
+    now_ms = 10 * 60 * 60 * 1000
+
+    assert rss_ingest.should_fetch({"enabled": True, "last_fetch_time": 0}, now_ms) is True
+    assert rss_ingest.should_fetch({"enabled": True, "last_fetch_time": now_ms - (2 * 60 * 60 * 1000)}, now_ms) is False
+    assert rss_ingest.should_fetch({"enabled": True, "last_fetch_time": now_ms - (3 * 60 * 60 * 1000)}, now_ms) is True
+    assert rss_ingest.should_fetch({"enabled": False, "last_fetch_time": 0}, now_ms) is False
+
+
 def test_parse_prompt_sections_splits_screen_and_summary():
     raw_prompt = """
 提示词
@@ -147,11 +145,26 @@ def test_build_prompt_wraps_article_in_input_text_block():
     assert "content：Test Content" in prompt
 
 
+def test_build_prompt_truncates_long_content(monkeypatch):
+    monkeypatch.setattr(rss_ingest.config, "PROMPT_TITLE_MAX_CHARS", 10)
+    monkeypatch.setattr(rss_ingest.config, "PROMPT_CONTENT_MAX_CHARS", 20)
+    prompt = rss_ingest.build_prompt(
+        {"title": "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "content": "x" * 40},
+        "System Prompt",
+    )
+
+    assert "[title truncated" in prompt
+    assert "[content truncated" in prompt
+
+
 def test_analyze_article_merges_screen_and_summary(monkeypatch):
     calls = []
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_MODEL", "model-default")
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_SCREEN_MODEL", "model-screen")
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_SUMMARIZE_MODEL", "model-summarize")
 
-    def fake_analyze(article, prompt):
-        calls.append(prompt)
+    def fake_analyze(article, prompt, primary_model=""):
+        calls.append((prompt, primary_model))
         if prompt == "screen prompt":
             return {
                 "action": "ingest",
@@ -179,14 +192,20 @@ def test_analyze_article_merges_screen_and_summary(monkeypatch):
     assert result["title_zh"] == "中文标题"
     assert result["one_liner"] == "一篇关于测试流程的文章"
     assert result["points"] == ["要点1", "要点2"]
-    assert calls == ["screen prompt", "summary prompt"]
+    assert rss_ingest.get_llm_meta(result)["llm_request_count"] == 2
+    assert calls == [
+        ("screen prompt", "model-screen"),
+        ("summary prompt", "model-summarize"),
+    ]
 
 
 def test_analyze_article_pass_skips_summary(monkeypatch):
     calls = []
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_MODEL", "model-default")
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_SCREEN_MODEL", "model-screen")
 
-    def fake_analyze(article, prompt):
-        calls.append(prompt)
+    def fake_analyze(article, prompt, primary_model=""):
+        calls.append((prompt, primary_model))
         return {
             "action": "pass",
             "reason": "命中过滤规则",
@@ -202,14 +221,15 @@ def test_analyze_article_pass_skips_summary(monkeypatch):
 
     assert result["action"] == "pass"
     assert result["reason"] == "命中过滤规则"
-    assert calls == ["screen prompt"]
+    assert rss_ingest.get_llm_meta(result)["llm_request_count"] == 1
+    assert calls == [("screen prompt", "model-screen")]
 
 
 def test_analyze_article_keyword_filter_skips_llm(monkeypatch):
     seen_calls = []
 
-    def fake_analyze(article, prompt):
-        seen_calls.append(prompt)
+    def fake_analyze(article, prompt, primary_model=""):
+        seen_calls.append((prompt, primary_model))
         return {"action": "ingest", "categories": ["news"], "score": 8.0, "reason": "x"}
 
     monkeypatch.setattr(rss_ingest, "analyze_with_nvidia", fake_analyze)
@@ -231,7 +251,10 @@ def test_analyze_article_keyword_filter_skips_llm(monkeypatch):
 
 
 def test_analyze_article_summary_failure_returns_failed_analysis(monkeypatch):
-    def fake_analyze(article, prompt):
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_SCREEN_MODEL", "model-screen")
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_SUMMARIZE_MODEL", "model-summarize")
+
+    def fake_analyze(article, prompt, primary_model=""):
         if prompt == "screen prompt":
             return {
                 "action": "ingest",
@@ -252,6 +275,11 @@ def test_analyze_article_summary_failure_returns_failed_analysis(monkeypatch):
     assert rss_ingest.is_failed_analysis(result)
     assert rss_ingest.get_llm_meta(result)["failure_stage"] == "summary"
     assert "summary:" in rss_ingest.get_llm_meta(result)["failure_reason"]
+    assert rss_ingest.get_llm_meta(result)["llm_request_count"] == 2
+
+
+def test_parse_llm_json_requires_object():
+    assert rss_ingest.parse_llm_json("[]", "NVIDIA") is None
 
 
 def test_analyze_with_nvidia_fallback_to_custom_api(monkeypatch):
@@ -285,6 +313,16 @@ def test_analyze_with_nvidia_fallback_to_custom_api(monkeypatch):
 def test_secondary_nvidia_constants_are_updated():
     assert rss_ingest.config.NVIDIA_SECONDARY_MODEL == "moonshotai/kimi-k2-instruct-0905"
     assert rss_ingest.PRIMARY_NVIDIA_MAX_TOKENS == 4096
+
+
+def test_stage_primary_models_use_default_screen_then_default_summarize(monkeypatch):
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_MODEL", "model-default")
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_SCREEN_MODEL", "")
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_SUMMARIZE_MODEL", "")
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_SECONDARY_MODEL", "model-screen-default")
+
+    assert rss_ingest.get_primary_screen_nvidia_model() == "model-default"
+    assert rss_ingest.get_primary_summarize_nvidia_model() == "model-default"
 
 
 def test_analyze_with_nvidia_prefers_custom_api_when_switch_enabled(monkeypatch):
@@ -356,6 +394,15 @@ def test_get_nvidia_models_returns_primary_then_secondary(monkeypatch):
 
     assert rss_ingest.get_nvidia_models() == [
         "model-primary",
+        rss_ingest.config.NVIDIA_SECONDARY_MODEL,
+    ]
+
+
+def test_get_nvidia_models_prefers_stage_override(monkeypatch):
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_MODEL", "model-default")
+
+    assert rss_ingest.get_nvidia_models("model-screen") == [
+        "model-screen",
         rss_ingest.config.NVIDIA_SECONDARY_MODEL,
     ]
 
@@ -491,7 +538,7 @@ def test_call_openai_compatible_retries_on_empty_json(monkeypatch):
         call_count["n"] += 1
         return responses[idx]
 
-    monkeypatch.setattr(rss_ingest.requests, "post", fake_post)
+    monkeypatch.setattr(rss_ingest, "post_json_without_env", fake_post)
 
     result, reason = rss_ingest.call_openai_compatible(
         "NVIDIA",
@@ -529,7 +576,7 @@ def test_call_openai_compatible_retries_on_invalid_action(monkeypatch):
         call_count["n"] += 1
         return responses[idx]
 
-    monkeypatch.setattr(rss_ingest.requests, "post", fake_post)
+    monkeypatch.setattr(rss_ingest, "post_json_without_env", fake_post)
 
     result, reason = rss_ingest.call_openai_compatible(
         "NVIDIA",
@@ -564,11 +611,11 @@ def test_call_openai_compatible_uses_model_specific_max_tokens(monkeypatch):
 
     payloads = []
 
-    def fake_post(_url, headers=None, json=None, timeout=None):
-        payloads.append(json)
+    def fake_post(_url, headers, payload, timeout):
+        payloads.append(payload)
         return FakeResp()
 
-    monkeypatch.setattr(rss_ingest.requests, "post", fake_post)
+    monkeypatch.setattr(rss_ingest, "post_json_without_env", fake_post)
 
     rss_ingest.call_openai_compatible("NVIDIA", "https://example.com/v1", "k", "model-primary", "prompt")
     rss_ingest.call_openai_compatible(
@@ -644,7 +691,7 @@ def test_run_llm_queue_skips_duplicate_writes(monkeypatch):
     monkeypatch.setattr(
         rss_ingest,
         "analyze_with_nvidia",
-        lambda article, prompt: {"categories": ["news"], "score": 1.0, "one_liner": "", "points": []},
+        lambda article, prompt, primary_model="": {"categories": ["news"], "score": 1.0, "one_liner": "", "points": []},
     )
 
     def fake_create(*args, **kwargs):
@@ -714,7 +761,7 @@ def test_run_llm_queue_counts_secondary_switch(monkeypatch):
     monkeypatch.setattr(
         rss_ingest,
         "analyze_with_nvidia",
-        lambda article, prompt: {
+        lambda article, prompt, primary_model="": {
             "categories": ["news"],
             "score": 1.0,
             "one_liner": "",
@@ -767,11 +814,13 @@ def test_run_llm_queue_calls_analyze_with_article_and_prompt(monkeypatch):
     monkeypatch.setattr(rss_ingest.config, "LLM_CONCURRENCY", 1)
     monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEY", "k1")
     monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEYS", [])
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_MODEL", "model-default")
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_SCREEN_MODEL", "model-screen")
 
     seen_calls = []
 
-    def fake_analyze(article, prompt):
-        seen_calls.append((article["title"], prompt))
+    def fake_analyze(article, prompt, primary_model=""):
+        seen_calls.append((article["title"], prompt, primary_model))
         return {"categories": ["news"], "score": 1.0, "one_liner": "", "points": []}
 
     monkeypatch.setattr(rss_ingest, "analyze_with_nvidia", fake_analyze)
@@ -818,7 +867,7 @@ def test_run_llm_queue_calls_analyze_with_article_and_prompt(monkeypatch):
 
     run_llm_queue(queue, source_states, "tenant", set(), "prompt", stats)
 
-    assert seen_calls == [("t1", "prompt"), ("t2", "prompt")]
+    assert seen_calls == [("t1", "prompt", "model-screen"), ("t2", "prompt", "model-screen")]
 
 
 def test_run_llm_queue_uses_effective_worker_count(monkeypatch):
@@ -850,7 +899,7 @@ def test_run_llm_queue_uses_effective_worker_count(monkeypatch):
     monkeypatch.setattr(
         rss_ingest,
         "analyze_with_nvidia",
-        lambda article, prompt: {"categories": ["news"], "score": 1.0, "one_liner": "", "points": []},
+        lambda article, prompt, primary_model="": {"categories": ["news"], "score": 1.0, "one_liner": "", "points": []},
     )
     monkeypatch.setattr(rss_ingest, "create_bitable_record_with_id", lambda *args, **kwargs: (True, "news-record"))
     monkeypatch.setattr(rss_ingest, "update_bitable_record_fields", lambda *args, **kwargs: True)
@@ -909,7 +958,7 @@ def test_run_llm_queue_filters_pass_action(monkeypatch):
     monkeypatch.setattr(
         rss_ingest,
         "analyze_with_nvidia",
-        lambda article, prompt: {"action": "pass", "reason": "命中过滤规则"},
+        lambda article, prompt, primary_model="": {"action": "pass", "reason": "命中过滤规则"},
     )
 
     def fake_create(*args, **kwargs):
@@ -1088,7 +1137,7 @@ def test_run_llm_queue_persists_finished_source_before_slow_source(monkeypatch):
     monkeypatch.setattr(
         rss_ingest,
         "analyze_with_nvidia",
-        lambda article, prompt: {"categories": ["news"], "score": 1.0, "one_liner": "", "points": []},
+        lambda article, prompt, primary_model="": {"categories": ["news"], "score": 1.0, "one_liner": "", "points": []},
     )
 
     def fake_create(*args, **kwargs):

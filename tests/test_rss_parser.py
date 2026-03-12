@@ -11,8 +11,8 @@ import rss_parser
 
 def test_fetch_feed_allows_bozo_if_entries_exist(monkeypatch):
     monkeypatch.setattr(
-        rss_parser.requests,
-        "get",
+        rss_parser,
+        "get_without_env",
         lambda *args, **kwargs: SimpleNamespace(status_code=200, content=b"<xml/>", text=""),
     )
     fake_feed = SimpleNamespace(bozo=True, bozo_exception=RuntimeError("bad feed"), entries=[{"id": "1"}])
@@ -25,8 +25,8 @@ def test_fetch_feed_allows_bozo_if_entries_exist(monkeypatch):
 
 def test_fetch_feed_raises_when_bozo_and_no_entries(monkeypatch):
     monkeypatch.setattr(
-        rss_parser.requests,
-        "get",
+        rss_parser,
+        "get_without_env",
         lambda *args, **kwargs: SimpleNamespace(status_code=200, content=b"<xml/>", text=""),
     )
     fake_feed = SimpleNamespace(bozo=True, bozo_exception=RuntimeError("bad feed"), entries=[])

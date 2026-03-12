@@ -8,6 +8,12 @@ import feedparser
 import requests
 
 
+def get_without_env(url: str, timeout: int, headers: Optional[Dict[str, str]] = None) -> requests.Response:
+    with requests.Session() as sess:
+        sess.trust_env = False
+        return sess.get(url, headers=headers, timeout=timeout)
+
+
 def normalize_entry(entry: Any) -> Dict[str, Any]:
     if isinstance(entry, dict):
         return entry
@@ -23,7 +29,7 @@ def fetch_feed(url: str, timeout: int, retries: int, headers: Optional[Dict[str,
     last_err: Optional[Exception] = None
     for attempt in range(retries):
         try:
-            resp = requests.get(url, headers=headers, timeout=timeout)
+            resp = get_without_env(url, timeout=timeout, headers=headers)
             if resp.status_code != 200:
                 raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
             feed = feedparser.parse(resp.content)
