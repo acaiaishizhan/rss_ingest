@@ -77,7 +77,7 @@ def test_llm_concurrency_uses_new_default(monkeypatch):
 
     reloaded = reload_config_module()
 
-    assert reloaded.LLM_CONCURRENCY == 5
+    assert reloaded.LLM_CONCURRENCY == 3
 
 
 def test_use_custom_api_uses_builtin_default_false(monkeypatch):
