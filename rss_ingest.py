@@ -523,8 +523,12 @@ def build_prompt(article: Dict[str, Any], system_prompt: str) -> str:
 
 你所处的时间为：{now.year}年{now.month:02d}月
 
+# Input Text
+请分析以下文章：
+\"\"\"
 title：{article.get('title','')}
 content：{article.get('content','')}
+\"\"\"
 """
 
 
@@ -716,6 +720,14 @@ def find_blocked_keyword(article: Dict[str, Any], keywords: List[str]) -> str:
         if normalized and normalized.lower() in haystack:
             return normalized
     return ""
+
+
+def has_filtered_table_config() -> bool:
+    return bool(str(config.FEISHU_FILTERED_TABLE_LINK or "").strip())
+
+
+def is_filtered_table_enabled() -> bool:
+    return bool(config.FEISHU_FILTERED_APP_TOKEN and config.FEISHU_FILTERED_TABLE_ID)
 
 
 def get_failed_category(analysis: Dict[str, Any], default: str = "解析失败") -> str:
@@ -1071,6 +1083,50 @@ def build_news_fields(article: Dict[str, Any], analysis: Dict[str, Any], item_ke
     }
 
 
+def build_filtered_fields(article: Dict[str, Any], analysis: Dict[str, Any], item_key: str) -> Dict[str, Any]:
+    published = article.get("published")
+    if isinstance(published, (int, float)) and published > 0:
+        base_ts = published
+    else:
+        base_ts = time.time()
+    published_ts_ms = int(base_ts * 1000)
+
+    raw_title = article.get("title") or "（无标题）"
+    reason = str(analysis.get("reason") or "").strip()
+    llm_meta = get_llm_meta(analysis)
+    filter_method = "关键词过滤" if llm_meta.get("keyword_filtered") else "初筛过滤"
+    keyword_hit = str(llm_meta.get("keyword_hit") or "").strip()
+    filter_reason = reason
+    if keyword_hit:
+        suffix = f"（命中关键词：{keyword_hit}）"
+        filter_reason = f"{filter_reason}{suffix}" if filter_reason else suffix
+
+    return {
+        config.FILTERED_FIELD_TITLE: {"text": raw_title, "link": article.get("link") or ""},
+        config.FILTERED_FIELD_FILTER_METHOD: filter_method,
+        config.FILTERED_FIELD_FILTER_REASON: filter_reason,
+        config.FILTERED_FIELD_PUBLISHED_MS: published_ts_ms,
+        config.FILTERED_FIELD_SOURCE: article.get("source") or "未知来源",
+        config.FILTERED_FIELD_FULL_CONTENT: clean_html_to_text(article.get("content") or ""),
+        config.FILTERED_FIELD_ITEM_KEY: item_key,
+    }
+
+
+def persist_filtered_article(article: Dict[str, Any], analysis: Dict[str, Any], item_key: str, tenant_token: str) -> bool:
+    if not is_filtered_table_enabled():
+        return False
+
+    ok, _ = create_bitable_record_with_id(
+        config.FEISHU_FILTERED_APP_TOKEN,
+        config.FEISHU_FILTERED_TABLE_ID,
+        tenant_token,
+        build_filtered_fields(article, analysis, item_key),
+        config.HTTP_TIMEOUT,
+        config.HTTP_RETRIES,
+    )
+    return ok
+
+
 def prefetch_recent_item_keys(tenant_token: str) -> set:
     sort_field = config.NEWS_FIELD_CREATED_TIME
     sort = [{"field_name": sort_field, "order": "desc"}]
@@ -1366,6 +1422,8 @@ def run_llm_queue(
     stats.setdefault("llm_requests_total", 0)
     stats.setdefault("llm_switched_to_secondary", 0)
     stats.setdefault("llm_secondary_success", 0)
+    stats.setdefault("filtered_logged", 0)
+    stats.setdefault("filtered_log_failed", 0)
 
     lock = threading.Lock()
     in_flight_keys: set = set()
@@ -1398,6 +1456,14 @@ def run_llm_queue(
             if action == "pass":
                 with lock:
                     stats["llm_filtered"] += 1
+                if is_filtered_table_enabled():
+                    logged = persist_filtered_article(article, analysis, item_key, tenant_token)
+                    with lock:
+                        if logged:
+                            stats["filtered_logged"] += 1
+                        else:
+                            stats["filtered_log_failed"] += 1
+                            log(f"[Filter] failed to persist filtered article item_key={item_key}")
                 return
 
             categories = analysis.get("categories") or []
@@ -1541,6 +1607,14 @@ def validate_runtime_config() -> List[str]:
         "FEISHU_PROMPT_DOC_LINK",
         "请在函数配置的环境变量中填写完整的飞书文档链接 FEISHU_PROMPT_DOC_LINK。",
     )
+    if has_filtered_table_config() and not config.FEISHU_FILTERED_APP_TOKEN:
+        errors.append(
+            "请确认 FEISHU_FILTERED_TABLE_LINK 是完整的飞书多维表链接，并包含 base 路径。"
+        )
+    if has_filtered_table_config() and not config.FEISHU_FILTERED_TABLE_ID:
+        errors.append(
+            "请确认 FEISHU_FILTERED_TABLE_LINK 是完整的飞书多维表链接，并包含 table 参数。"
+        )
     custom_api_missing = get_custom_api_missing_fields()
     if should_use_custom_api() and custom_api_missing:
         errors.append(
@@ -1576,6 +1650,7 @@ def main() -> Dict[str, Any]:
             "[Config] startup validation passed. "
             f"business_config_source={config.PRIMARY_CONFIG_SOURCE_SUMMARY} "
             f"llm_primary_route={'custom' if should_use_custom_api() else 'nvidia'} "
+            f"filtered_table={'on' if is_filtered_table_enabled() else 'off'} "
             f"llm_concurrency_per_key={config.LLM_CONCURRENCY} "
             f"nvidia_keys={len(get_nvidia_api_keys())} "
             f"llm_workers={get_effective_llm_workers()}"
@@ -1621,6 +1696,8 @@ def main() -> Dict[str, Any]:
         stats = {
             "llm_success": 0,
             "llm_filtered": 0,
+            "filtered_logged": 0,
+            "filtered_log_failed": 0,
             "llm_failed": 0,
             "llm_requests_total": 0,
             "llm_switched_to_secondary": 0,
@@ -1645,6 +1722,8 @@ def main() -> Dict[str, Any]:
             f"new={stats['entries_new']} "
             f"llm_ok={stats['llm_success']} "
             f"llm_filtered={stats['llm_filtered']} "
+            f"filtered_logged={stats['filtered_logged']} "
+            f"filtered_log_failed={stats['filtered_log_failed']} "
             f"llm_failed={stats['llm_failed']} "
             f"secondary_switch={stats['llm_switched_to_secondary']}/{stats['llm_requests_total']}({format_ratio(stats['llm_switched_to_secondary'], stats['llm_requests_total'])}) "
             f"secondary_recovered={stats['llm_secondary_success']} "

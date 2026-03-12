@@ -133,6 +133,20 @@ summary body
     assert sections["keyword_blocklist"] == ["以太坊", "Web3"]
 
 
+def test_build_prompt_wraps_article_in_input_text_block():
+    prompt = rss_ingest.build_prompt(
+        {"title": "Test Title", "content": "Test Content"},
+        "System Prompt",
+    )
+
+    assert "System Prompt" in prompt
+    assert "# Input Text" in prompt
+    assert "请分析以下文章：" in prompt
+    assert '"""' in prompt
+    assert "title：Test Title" in prompt
+    assert "content：Test Content" in prompt
+
+
 def test_analyze_article_merges_screen_and_summary(monkeypatch):
     calls = []
 
@@ -429,6 +443,29 @@ def test_validate_runtime_config_requires_custom_api_when_switch_enabled(monkeyp
     errors = rss_ingest.validate_runtime_config()
 
     assert any("USE_CUSTOM_API=true" in error for error in errors)
+
+
+def test_validate_runtime_config_rejects_invalid_filtered_table_link(monkeypatch):
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_APP_ID", "app-id")
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_APP_SECRET", "app-secret")
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_NEWS_APP_TOKEN", "news-token")
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_NEWS_TABLE_ID", "news-table")
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_RSS_APP_TOKEN", "rss-token")
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_RSS_TABLE_ID", "rss-table")
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_PROMPT_DOC_TOKEN", "doc-token")
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEY", "n-key")
+    monkeypatch.setattr(rss_ingest.config, "NVIDIA_API_KEYS", [])
+    monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_KEY", "")
+    monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_BASE", "")
+    monkeypatch.setattr(rss_ingest.config, "CUSTOM_API_MODEL", "")
+    monkeypatch.setattr(rss_ingest.config, "USE_CUSTOM_API", False)
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_FILTERED_TABLE_LINK", "https://example.com/not-a-bitable-link")
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_FILTERED_APP_TOKEN", "")
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_FILTERED_TABLE_ID", "")
+
+    errors = rss_ingest.validate_runtime_config()
+
+    assert any("FEISHU_FILTERED_TABLE_LINK" in error for error in errors)
 
 
 def test_call_openai_compatible_retries_on_empty_json(monkeypatch):
@@ -866,6 +903,9 @@ def test_run_llm_queue_filters_pass_action(monkeypatch):
     update_calls = []
 
     monkeypatch.setattr(rss_ingest.config, "LLM_CONCURRENCY", 1)
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_FILTERED_TABLE_LINK", "")
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_FILTERED_APP_TOKEN", "")
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_FILTERED_TABLE_ID", "")
     monkeypatch.setattr(
         rss_ingest,
         "analyze_with_nvidia",
@@ -923,6 +963,73 @@ def test_run_llm_queue_filters_pass_action(monkeypatch):
     assert update_calls == ["r1"]
     assert source_states["r1"]["pending_count"] == 0
     assert source_states["r1"]["persisted"] is True
+
+
+def test_run_llm_queue_persists_filtered_article_when_enabled(monkeypatch):
+    create_calls = []
+
+    monkeypatch.setattr(rss_ingest.config, "LLM_CONCURRENCY", 1)
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_FILTERED_TABLE_LINK", "https://example.com/base/app?table=tbl")
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_FILTERED_APP_TOKEN", "filtered-app")
+    monkeypatch.setattr(rss_ingest.config, "FEISHU_FILTERED_TABLE_ID", "filtered-table")
+
+    def fake_analyze_article(article, prompt_config):
+        return rss_ingest.attach_llm_meta(
+            {"action": "pass", "reason": "命中过滤规则"},
+            llm_request_count=1,
+        )
+
+    def fake_create(app_token, table_id, tenant_token, fields, *_args, **_kwargs):
+        create_calls.append((app_token, table_id, fields))
+        return True, "filtered-record"
+
+    monkeypatch.setattr(rss_ingest, "analyze_article", fake_analyze_article)
+    monkeypatch.setattr(rss_ingest, "create_bitable_record_with_id", fake_create)
+    monkeypatch.setattr(rss_ingest, "update_bitable_record_fields", lambda *args, **kwargs: True)
+
+    source_states = {
+        "r1": {
+            "source": {"record_id": "r1", "name": "feed-1", "feed_url": "https://example.com/rss"},
+            "now_ms": 123,
+            "latest_pub_ms": 456,
+            "latest_key": "k1",
+            "updated_failed_items": [],
+            "new_count": 0,
+            "pending_count": 1,
+            "persisted": False,
+        }
+    }
+    queue = [
+        {
+            "source_id": "r1",
+            "item_key": "k1",
+            "article": {"title": "t", "content": "x", "link": "https://example.com/a", "published": 0, "source": "feed-1"},
+            "entry_ts": 0,
+            "entry_ts_ms": 0,
+            "from_failed": False,
+        }
+    ]
+    stats = {
+        "llm_success": 0,
+        "llm_filtered": 0,
+        "filtered_logged": 0,
+        "filtered_log_failed": 0,
+        "llm_failed": 0,
+        "feishu_create_failed": 0,
+        "entries_processed": 0,
+        "entries_new": 0,
+    }
+
+    run_llm_queue(queue, source_states, "tenant", set(), {"screen_prompt": "s1", "summarize_prompt": "s2"}, stats)
+
+    assert stats["llm_filtered"] == 1
+    assert stats["filtered_logged"] == 1
+    assert stats["filtered_log_failed"] == 0
+    assert create_calls[0][0] == "filtered-app"
+    assert create_calls[0][1] == "filtered-table"
+    assert create_calls[0][2][rss_ingest.config.FILTERED_FIELD_ITEM_KEY] == "k1"
+    assert create_calls[0][2][rss_ingest.config.FILTERED_FIELD_FILTER_METHOD] == "初筛过滤"
+    assert create_calls[0][2][rss_ingest.config.FILTERED_FIELD_FILTER_REASON] == "命中过滤规则"
 
 
 def test_run_llm_queue_records_stage_failure_reason(monkeypatch):
