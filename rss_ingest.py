@@ -21,9 +21,27 @@ from feishu_client import (
 from rss_parser import build_item_key, entry_published_ts, entry_text_content, fetch_feed, normalize_entry
 
 FAILED_CATEGORIES = {"调用失败", "调用异常", "解析失败", "JSON解析失败", "异常"}
-KEYWORD_BLOCKLIST_MARKER = "KEYWORD_BLOCKLIST"
-PROMPT_SCREEN_MARKER = "PROMPT_SCREEN"
-PROMPT_SUMMARIZE_MARKER = "PROMPT_SUMMARIZE"
+KEYWORD_BLOCKLIST_MARKER = "关键词过滤"
+PROMPT_SCREEN_MARKER = "提示词1：筛选、评分、标签"
+PROMPT_SUMMARIZE_MARKER = "提示词2：标题、摘要"
+KEYWORD_BLOCKLIST_MARKER_ALIASES = (
+    KEYWORD_BLOCKLIST_MARKER,
+    "KEYWORD_BLOCKLIST",
+)
+PROMPT_SCREEN_MARKER_ALIASES = (
+    PROMPT_SCREEN_MARKER,
+    "提示词1:筛选、评分、标签",
+    "提示词：筛选、评分、标签",
+    "提示词:筛选、评分、标签",
+    "PROMPT_SCREEN",
+)
+PROMPT_SUMMARIZE_MARKER_ALIASES = (
+    PROMPT_SUMMARIZE_MARKER,
+    "提示词2:标题、摘要",
+    "提示词：标题、摘要",
+    "提示词:标题、摘要",
+    "PROMPT_SUMMARIZE",
+)
 PRIMARY_NVIDIA_MAX_TOKENS = 4096
 SECONDARY_NVIDIA_MAX_TOKENS = 4096
 DEFAULT_MAX_TOKENS = 4096
@@ -508,16 +526,30 @@ def call_nvidia_compatible(model_name: str, prompt: str) -> tuple[Dict[str, Any]
         release_nvidia_api_key(api_key)
 
 
+def find_marker_match(text: str, aliases: tuple[str, ...]) -> Optional[re.Match[str]]:
+    candidates: List[re.Match[str]] = []
+    for marker in aliases:
+        match = re.search(rf"(?m)^\s*{re.escape(marker)}\s*$", text)
+        if match:
+            candidates.append(match)
+    if not candidates:
+        return None
+    return min(candidates, key=lambda m: m.start())
+
+
 def parse_prompt_sections(raw_content: str) -> Dict[str, str]:
     text = str(raw_content or "").replace("\r\n", "\n")
-    screen_match = re.search(rf"(?m)^\s*{PROMPT_SCREEN_MARKER}\s*$", text)
-    summarize_match = re.search(rf"(?m)^\s*{PROMPT_SUMMARIZE_MARKER}\s*$", text)
+    screen_match = find_marker_match(text, PROMPT_SCREEN_MARKER_ALIASES)
+    summarize_match = find_marker_match(text, PROMPT_SUMMARIZE_MARKER_ALIASES)
     if not screen_match or not summarize_match:
         raise ValueError(
-            f"prompt document must contain marker lines: {PROMPT_SCREEN_MARKER} and {PROMPT_SUMMARIZE_MARKER}"
+            "prompt document must contain marker lines: "
+            f"{PROMPT_SCREEN_MARKER} and {PROMPT_SUMMARIZE_MARKER}"
         )
     if summarize_match.start() <= screen_match.end():
-        raise ValueError(f"{PROMPT_SUMMARIZE_MARKER} must appear after {PROMPT_SCREEN_MARKER}")
+        raise ValueError(
+            f"{PROMPT_SUMMARIZE_MARKER} must appear after {PROMPT_SCREEN_MARKER}"
+        )
 
     screen_prompt = text[screen_match.end():summarize_match.start()].strip()
     summarize_prompt = text[summarize_match.end():].strip()
@@ -526,7 +558,7 @@ def parse_prompt_sections(raw_content: str) -> Dict[str, str]:
     if not summarize_prompt:
         raise ValueError(f"{PROMPT_SUMMARIZE_MARKER} section is empty")
     blocklist_keywords: List[str] = []
-    blocklist_match = re.search(rf"(?m)^\s*{KEYWORD_BLOCKLIST_MARKER}\s*$", text)
+    blocklist_match = find_marker_match(text, KEYWORD_BLOCKLIST_MARKER_ALIASES)
     if blocklist_match and blocklist_match.start() < screen_match.start():
         raw_block = text[blocklist_match.end():screen_match.start()]
         for raw_line in raw_block.splitlines():
