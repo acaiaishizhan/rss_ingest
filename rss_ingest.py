@@ -1,6 +1,8 @@
 ﻿# -*- coding: utf-8 -*-
 import datetime as dt
+import importlib
 import json
+import os
 import re
 import sys
 import threading
@@ -42,6 +44,45 @@ PROMPT_SUMMARIZE_MARKER_ALIASES = (
     "提示词:标题、摘要",
     "PROMPT_SUMMARIZE",
 )
+FALLBACK_PARAMS_MARKER = "备用参数"
+FALLBACK_PARAMS_MARKER_ALIASES = (
+    FALLBACK_PARAMS_MARKER,
+    "备用参数：",
+    "FALLBACK_PARAMS",
+    "FALLBACK_ENV",
+)
+SUPPORTED_FALLBACK_ENV_KEYS = {
+    "FEISHU_NEWS_TABLE_LINK",
+    "FEISHU_RSS_TABLE_LINK",
+    "FEISHU_FILTERED_TABLE_LINK",
+    "NVIDIA_API_KEY",
+    "NVIDIA_API_KEYS",
+    "NVIDIA_MODEL",
+    "NVIDIA_SCREEN_MODEL",
+    "NVIDIA_SUMMARIZE_MODEL",
+    "NVIDIA_SECONDARY_MODEL",
+    "CUSTOM_API_KEY",
+    "CUSTOM_API_BASE",
+    "CUSTOM_API_MODEL",
+    "USE_CUSTOM_API",
+    "HTTP_TIMEOUT",
+    "HTTP_RETRIES",
+    "NVIDIA_RETRIES",
+    "FAILED_ITEMS_MAX",
+    "FAILED_ITEMS_RETRY_LIMIT",
+    "FAILED_ITEMS_MAX_AGE_DAYS",
+    "FAILED_ITEMS_MAX_MISS",
+    "LLM_CONCURRENCY",
+    "PROGRESS_BAR_WIDTH",
+    "PROMPT_TITLE_MAX_CHARS",
+    "PROMPT_CONTENT_MAX_CHARS",
+    "AUTO_FETCH_INTERVAL_HOURS",
+}
+SENSITIVE_FALLBACK_ENV_KEYS = {
+    "NVIDIA_API_KEY",
+    "NVIDIA_API_KEYS",
+    "CUSTOM_API_KEY",
+}
 PRIMARY_NVIDIA_MAX_TOKENS = 4096
 SECONDARY_NVIDIA_MAX_TOKENS = 4096
 DEFAULT_MAX_TOKENS = 4096
@@ -537,7 +578,66 @@ def find_marker_match(text: str, aliases: tuple[str, ...]) -> Optional[re.Match[
     return min(candidates, key=lambda m: m.start())
 
 
-def parse_prompt_sections(raw_content: str) -> Dict[str, str]:
+def parse_fallback_env_block(raw_block: str) -> Dict[str, str]:
+    fallback_env: Dict[str, str] = {}
+    for raw_line in raw_block.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("-"):
+            line = line[1:].strip()
+        if line.startswith("#"):
+            line = line[1:].strip()
+        if not line:
+            continue
+        if len(line) >= 2 and line[0] == line[-1] and line[0] in ("`",):
+            line = line[1:-1].strip()
+
+        separator = "=" if "=" in line else ":" if ":" in line else ""
+        if not separator:
+            continue
+        name, value = line.split(separator, 1)
+        key = name.strip().upper()
+        val = value.split("#", 1)[0].strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        if not key or not val:
+            continue
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+            continue
+        fallback_env[key] = val
+    return fallback_env
+
+
+def mask_fallback_env_value(key: str, value: str) -> str:
+    if key not in SENSITIVE_FALLBACK_ENV_KEYS:
+        return value
+    if len(value) <= 8:
+        return "***"
+    return f"{value[:4]}***{value[-4:]}"
+
+
+def apply_prompt_fallback_env(fallback_env: Dict[str, str]) -> Dict[str, str]:
+    applied: Dict[str, str] = {}
+    for key, value in fallback_env.items():
+        if key not in SUPPORTED_FALLBACK_ENV_KEYS:
+            continue
+        existing = os.getenv(key)
+        if existing is not None and existing.strip():
+            continue
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            continue
+        os.environ[key] = cleaned
+        applied[key] = cleaned
+
+    if applied:
+        importlib.reload(config)
+        config.PRIMARY_CONFIG_SOURCE_SUMMARY = "env+prompt_fallback"
+    return applied
+
+
+def parse_prompt_sections(raw_content: str) -> Dict[str, Any]:
     text = str(raw_content or "").replace("\r\n", "\n")
     screen_match = find_marker_match(text, PROMPT_SCREEN_MARKER_ALIASES)
     summarize_match = find_marker_match(text, PROMPT_SUMMARIZE_MARKER_ALIASES)
@@ -552,7 +652,14 @@ def parse_prompt_sections(raw_content: str) -> Dict[str, str]:
         )
 
     screen_prompt = text[screen_match.end():summarize_match.start()].strip()
-    summarize_prompt = text[summarize_match.end():].strip()
+    summarize_end = len(text)
+    fallback_env: Dict[str, str] = {}
+    fallback_match = find_marker_match(text, FALLBACK_PARAMS_MARKER_ALIASES)
+    if fallback_match and fallback_match.start() > summarize_match.end():
+        summarize_end = fallback_match.start()
+        fallback_env = parse_fallback_env_block(text[fallback_match.end():])
+
+    summarize_prompt = text[summarize_match.end():summarize_end].strip()
     if not screen_prompt:
         raise ValueError(f"{PROMPT_SCREEN_MARKER} section is empty")
     if not summarize_prompt:
@@ -571,6 +678,7 @@ def parse_prompt_sections(raw_content: str) -> Dict[str, str]:
         "screen_prompt": screen_prompt,
         "summarize_prompt": summarize_prompt,
         "keyword_blocklist": blocklist_keywords,
+        "fallback_env": fallback_env,
     }
 
 
@@ -1683,6 +1791,31 @@ def run_llm_queue(
             sys.stdout.flush()
 
 
+def validate_bootstrap_config() -> List[str]:
+    errors: List[str] = []
+
+    def require(value: str, label: str, hint: str) -> None:
+        if not value:
+            errors.append(f"{label} 未配置。{hint}")
+
+    require(
+        config.FEISHU_APP_ID,
+        "FEISHU_APP_ID",
+        "请在函数配置的环境变量中填写 FEISHU_APP_ID。",
+    )
+    require(
+        config.FEISHU_APP_SECRET,
+        "FEISHU_APP_SECRET",
+        "请在函数配置的环境变量中填写 FEISHU_APP_SECRET。",
+    )
+    require(
+        config.FEISHU_PROMPT_DOC_TOKEN,
+        "FEISHU_PROMPT_DOC_LINK",
+        "请在函数配置的环境变量中填写完整的飞书文档链接 FEISHU_PROMPT_DOC_LINK。",
+    )
+    return errors
+
+
 def validate_runtime_config() -> List[str]:
     errors: List[str] = []
 
@@ -1759,6 +1892,37 @@ def log_runtime_config_errors(errors: List[str]) -> None:
 
 def main() -> Dict[str, Any]:
     try:
+        bootstrap_errors = validate_bootstrap_config()
+        if bootstrap_errors:
+            log_runtime_config_errors(bootstrap_errors)
+            raise RuntimeError("required bootstrap configuration is missing or invalid")
+
+        tenant_token = get_tenant_access_token(config.FEISHU_APP_ID, config.FEISHU_APP_SECRET, config.HTTP_TIMEOUT, config.HTTP_RETRIES)
+        prompt_document = get_document_raw_content(
+            config.FEISHU_PROMPT_DOC_TOKEN,
+            tenant_token,
+            config.HTTP_TIMEOUT,
+            config.HTTP_RETRIES,
+        )
+        log(f"[Prompt] fetched {len(prompt_document)} chars")
+        if not prompt_document.strip():
+            raise RuntimeError("prompt document is empty")
+        prompt_sections = parse_prompt_sections(prompt_document)
+        fallback_env_raw = prompt_sections.get("fallback_env") or {}
+        fallback_env = fallback_env_raw if isinstance(fallback_env_raw, dict) else {}
+        applied_fallback = apply_prompt_fallback_env(fallback_env)
+        if fallback_env:
+            supported_count = sum(1 for key in fallback_env if key in SUPPORTED_FALLBACK_ENV_KEYS)
+            applied_display = ", ".join(
+                f"{key}={mask_fallback_env_value(key, value)}"
+                for key, value in sorted(applied_fallback.items())
+            ) or "-"
+            log(
+                "[Config] prompt fallback parsed "
+                f"all={len(fallback_env)} supported={supported_count} applied={len(applied_fallback)} "
+                f"applied_keys={applied_display}"
+            )
+
         config_errors = validate_runtime_config()
         if config_errors:
             log_runtime_config_errors(config_errors)
@@ -1780,17 +1944,6 @@ def main() -> Dict[str, Any]:
             "[Config] Actual run frequency comes from the trigger cadence, "
             f"with code-side fetch interval gate={config.AUTO_FETCH_INTERVAL_HOURS}h."
         )
-        tenant_token = get_tenant_access_token(config.FEISHU_APP_ID, config.FEISHU_APP_SECRET, config.HTTP_TIMEOUT, config.HTTP_RETRIES)
-        prompt_document = get_document_raw_content(
-            config.FEISHU_PROMPT_DOC_TOKEN,
-            tenant_token,
-            config.HTTP_TIMEOUT,
-            config.HTTP_RETRIES,
-        )
-        log(f"[Prompt] fetched {len(prompt_document)} chars")
-        if not prompt_document.strip():
-            raise RuntimeError("prompt document is empty")
-        prompt_sections = parse_prompt_sections(prompt_document)
         log(
             "[Prompt] sections parsed "
             f"keyword_blocklist={len(prompt_sections.get('keyword_blocklist') or [])} "
