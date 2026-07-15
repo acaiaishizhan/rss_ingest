@@ -1,53 +1,121 @@
 name: rss-ingest
 
+permissions:
+  contents: read
+
 on:
-  schedule:
-    # Hourly trigger; actual fetch cadence is controlled by AUTO_FETCH_INTERVAL_HOURS in app config.
-    - cron: "0 * * * *"
   workflow_dispatch:
+    inputs:
+      preflight_only:
+        description: Validate secrets and private RSS snapshots without writing Feishu
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: "7,17,27,37,47,57 * * * *"
 
 concurrency:
-  group: rss-ingest
+  group: feishu-write
   cancel-in-progress: false
 
 jobs:
-  run:
+  ingest:
+    if: github.event_name == 'workflow_dispatch' || vars.RSS_INGEST_ENABLED == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
-      FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
-      FEISHU_NEWS_TABLE_LINK: ${{ secrets.FEISHU_NEWS_TABLE_LINK }}
-      FEISHU_RSS_TABLE_LINK: ${{ secrets.FEISHU_RSS_TABLE_LINK }}
-      FEISHU_FILTERED_TABLE_LINK: ${{ secrets.FEISHU_FILTERED_TABLE_LINK }}
-      FEISHU_PROMPT_DOC_LINK: ${{ secrets.FEISHU_PROMPT_DOC_LINK }}
-      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-      NVIDIA_API_KEYS: ${{ secrets.NVIDIA_API_KEYS }}
-      NVIDIA_MODEL: ${{ vars.NVIDIA_MODEL }}
-      NVIDIA_SCREEN_MODEL: ${{ vars.NVIDIA_SCREEN_MODEL }}
-      NVIDIA_SUMMARIZE_MODEL: ${{ vars.NVIDIA_SUMMARIZE_MODEL }}
-      NVIDIA_SECONDARY_MODEL: ${{ vars.NVIDIA_SECONDARY_MODEL }}
-      CUSTOM_API_KEY: ${{ secrets.CUSTOM_API_KEY }}
-      CUSTOM_API_BASE: ${{ vars.CUSTOM_API_BASE }}
-      CUSTOM_API_MODEL: ${{ vars.CUSTOM_API_MODEL }}
-      USE_CUSTOM_API: ${{ vars.USE_CUSTOM_API }}
-      AUTO_FETCH_INTERVAL_HOURS: ${{ vars.AUTO_FETCH_INTERVAL_HOURS || '3' }}
-      HTTP_TIMEOUT: ${{ vars.HTTP_TIMEOUT || '20' }}
-      HTTP_RETRIES: ${{ vars.HTTP_RETRIES || '3' }}
-      LLM_CONCURRENCY: ${{ vars.LLM_CONCURRENCY || '3' }}
-      PROMPT_TITLE_MAX_CHARS: ${{ vars.PROMPT_TITLE_MAX_CHARS || '300' }}
-      PROMPT_CONTENT_MAX_CHARS: ${{ vars.PROMPT_CONTENT_MAX_CHARS || '12000' }}
+    timeout-minutes: 90
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Setup Python
-        uses: actions/setup-python@v6
+      # Keep this proven workflow identity as the clock. Business code stays in
+      # rss-ingest-action so scheduler changes never create a second codebase.
+      - name: Checkout ingest code
+        uses: actions/checkout@v4
         with:
-          python-version: "3.10"
+          repository: acaiaishizhan/rss-ingest-action
+          ref: main
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Checkout private RSS snapshots
+        id: runtime_data
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: acaiaishizhan/rss-runtime-data
+          ssh-key: ${{ secrets.RSS_DATA_DEPLOY_KEY }}
+          path: runtime-data
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Configure runtime source mapping
+        shell: bash
+        run: |
+          if [[ -f "$GITHUB_WORKSPACE/runtime-data/source-map.json" ]]; then
+            echo "RSS_SOURCE_OVERRIDE_FILE=$GITHUB_WORKSPACE/runtime-data/source-map.json" >> "$GITHUB_ENV"
+            echo "Private RSS source mapping loaded."
+          else
+            echo "RSS_SOURCE_OVERRIDE_FILE=" >> "$GITHUB_ENV"
+            echo "::warning::Private RSS snapshots are unavailable; public feeds will continue."
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt
+
+      - name: Validate GitHub runtime
+        if: github.event_name == 'workflow_dispatch' && inputs.preflight_only == true
+        env:
+          ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_APP_TOKEN: ${{ secrets.FEISHU_APP_TOKEN }}
+          FEISHU_NEWS_TABLE_ID: ${{ secrets.FEISHU_NEWS_TABLE_ID }}
+          FEISHU_RSS_TABLE_ID: ${{ secrets.FEISHU_RSS_TABLE_ID }}
+          FEISHU_FILTERED_TABLE_ID: ${{ secrets.FEISHU_FILTERED_TABLE_ID }}
+          FEISHU_KEYWORD_TABLE_ID: ${{ secrets.FEISHU_KEYWORD_TABLE_ID }}
+        run: python tools/github_runtime_preflight.py --source-map "$RSS_SOURCE_OVERRIDE_FILE"
 
       - name: Run RSS ingest
+        if: github.event_name != 'workflow_dispatch' || inputs.preflight_only != true
+        env:
+          PYTHONUNBUFFERED: "1"
+          TZ: Asia/Shanghai
+          RSS_INGEST_SKIP_LOCAL_ENV: "true"
+          RSS_SOURCE_MODE: github
+          DEFAULT_FETCH_INTERVAL_MIN: "0"
+          USE_SYSTEM_PROXY: "false"
+          ENABLE_BROWSER_ARTICLE_FETCH: "false"
+          ENABLE_X_BROWSER_FALLBACK: "false"
+          KEYWORD_SNAPSHOT_GIT_FETCH: "false"
+          KEYWORD_RUNTIME_SNAPSHOT_PATH: ${{ runner.temp }}/keyword_snapshot_runtime.json
+          LLM_PROVIDER: ark
+          TEXT_DEDUP_PROVIDER: ark
+          ARK_API_KEY: ${{ secrets.ARK_API_KEY }}
+          ARK_BASE_URL: ${{ secrets.ARK_BASE_URL }}
+          ARK_MODEL: ${{ secrets.ARK_MODEL || 'deepseek-v4-flash' }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_APP_TOKEN: ${{ secrets.FEISHU_APP_TOKEN }}
+          FEISHU_NEWS_TABLE_ID: ${{ secrets.FEISHU_NEWS_TABLE_ID }}
+          FEISHU_RSS_TABLE_ID: ${{ secrets.FEISHU_RSS_TABLE_ID }}
+          FEISHU_FILTERED_TABLE_ID: ${{ secrets.FEISHU_FILTERED_TABLE_ID }}
+          FEISHU_KEYWORD_TABLE_ID: ${{ secrets.FEISHU_KEYWORD_TABLE_ID }}
+          FEISHU_NOTIFY_TABLE_ID: ${{ secrets.FEISHU_NOTIFY_TABLE_ID }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
         run: python rss_ingest.py
+
+      - name: Upload ingest logs
+        if: always() && (github.event_name != 'workflow_dispatch' || inputs.preflight_only != true)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rss-ingest-${{ github.run_id }}
+          path: out/rss-ingest/logs/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Report degraded private snapshot checkout
+        if: always() && steps.runtime_data.outcome == 'failure'
+        run: echo "::warning::Private RSS checkout failed; this run processed public sources only."
